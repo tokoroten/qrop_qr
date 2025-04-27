@@ -4,12 +4,17 @@
 - まず、jupyter_experimental_code/qr_detect_opencv.ipynb を読み込み、以後の設計の参考にせよ
 
 ## 画面設計
-- ウィンドウは、左側と右側に分け、比率は1:1とする
-- 左側にカメラから撮影された画像＋QRコードの四隅に従って枠線を表示
-- 右側には、QRコードの座標を元に、入力画像を透視変換した画像を表示
+- ウィンドウは、上側と下側に分け、比率は1:1とする
+- 上側にカメラから撮影された画像＋QRコードの四隅に従って枠線を表示
+- 下側には、QRコードの座標を元に、入力画像を透視変換した画像を表示
   - QRコードが検出できない場合は、直近に検出したQRコードの座標を元に透視変換画像を表示する
   - 複数のQRコードが検出された場合は、最後に検出したQRコードの内容と等しいQRコードを利用する
 - ウィンドウはリアルタイムに更新し続ける
+
+## 追加仕様
+- QRコードを検出したら、TrackerCSRT_create()を使って、QRコードの周囲の特徴点を追跡する
+- QRコードが検出できなかったら、QRコードの周囲の特徴点を元に、QRコードの座標を推定し、透視変換を行う
+
 """
 
 import cv2
@@ -40,6 +45,11 @@ class QRPerspectiveDemo:
         self.last_qr_info = None
         self.last_detection_time = 0
         
+        # トラッキング用の変数
+        self.tracker = None
+        self.lost_counter = 0      # 連続でQRコードを見失った回数
+        self.max_lost_frames = 30  # トラッカーをリセットするまでの最大フレーム数
+                
     def set_max_resolution(self):
         """
         カメラの利用可能な解像度を取得し、最大解像度を設定。
@@ -174,7 +184,7 @@ class QRPerspectiveDemo:
         retval, decoded_info, points, _ = self.detector.detectAndDecodeMulti(frame)
         return retval, decoded_info, points
     
-    def draw_qr_boundaries(self, frame, qr_points, qr_info):
+    def draw_qr_boundaries(self, frame, qr_points, qr_info, bbox=None):
         """
         QRコードの境界線と情報を描画
         
@@ -182,12 +192,21 @@ class QRPerspectiveDemo:
             frame: 描画対象の画像
             qr_points: QRコードの座標
             qr_info: QRコードの内容
+            bbox: トラッキングボックス（オプション）
             
         Returns:
             修正された画像
         """
         img_with_qr = frame.copy()
         
+        # トラッキングボックスがあれば描画
+        if bbox is not None:
+            x, y, w, h = map(int, bbox)
+            cv2.rectangle(img_with_qr, (x, y), (x+w, y+h), (255, 0, 0), 2)
+            cv2.putText(img_with_qr, "Tracking", (x, y-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+        
+        # QRコードの境界線があれば描画
         if qr_points is not None:
             for i, (info, pts) in enumerate(zip(qr_info, qr_points)):
                 # 座標を整数形式に変換
@@ -196,8 +215,30 @@ class QRPerspectiveDemo:
                 # QRコードの境界線を描画
                 cv2.polylines(img_with_qr, [pts], True, (0, 255, 0), 2)
                 
-                # デコードされた情報を追加
-                x, y = pts[0][0], pts[0][1]
+                # 配列の形式によって適切に座標を取得する
+                if pts.shape[0] == 4 and pts.shape[1] == 2:
+                    # 形状が (4, 2) の場合（各点が直接配列に保存されている）
+                    x = int(pts[0][0])
+                    y = int(pts[0][1])
+                elif pts.shape[0] == 4 and pts.shape[1] == 1 and pts.shape[2] == 2:
+                    # 形状が (4, 1, 2) の場合（各点が [x, y] という配列として保存されている）
+                    x = int(pts[0][0][0])
+                    y = int(pts[0][0][1])
+                else:
+                    # その他の形状の場合、最初の点の座標を安全に取得
+                    try:
+                        # 配列を平坦化して最初の2つの要素を使用
+                        flat_pts = pts.flatten()
+                        if len(flat_pts) >= 2:
+                            x = int(flat_pts[0])
+                            y = int(flat_pts[1])
+                        else:
+                            # 十分な座標がない場合はデフォルト値を使用
+                            x, y = 10, 20
+                    except:
+                        # エラーが発生した場合はデフォルト値を使用
+                        x, y = 10, 20
+                
                 cv2.putText(img_with_qr, f"QR: {info}", (x, y-10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
                 
@@ -273,42 +314,140 @@ class QRPerspectiveDemo:
         Returns:
             tuple: (QRコード検出結果画像, 透視変換画像)
         """
-        # QRコード検出
-        retval, decoded_info, points = self.detect_qr_codes(frame)
-        
         selected_qr_points = None
         selected_qr_info = []
+        tracking_bbox = None
         
-        if retval:
-            self.last_detection_time = time.time()
+        # 1. まず既存のトラッカーがあれば追跡を試みる
+        if self.tracker is not None:
+            tracking_success, bbox = self.tracker.update(frame)
             
-            # 前回検出されたQRコード情報がある場合
-            if self.last_qr_info is not None:
-                # 前回と同じ内容のQRコードを探す
-                for i, info in enumerate(decoded_info):
-                    if info == self.last_qr_info:
-                        selected_qr_points = points[i]
-                        selected_qr_info = [info]
-                        break
-            
-            # 前回と同じQRコードが見つからなかった場合は最後のQRコードを使用
-            if selected_qr_points is None and len(points) > 0:
-                selected_qr_points = points[-1]
-                selected_qr_info = [decoded_info[-1]]
-                self.last_qr_info = decoded_info[-1]
-            
-            self.last_qr_points = selected_qr_points
-            
-        else:
-            # QRコードが検出されなかった場合、直近の座標を使用
-            if self.last_qr_points is not None and time.time() - self.last_detection_time < 5:  # 5秒以内に検出されたもののみ使用
-                selected_qr_points = self.last_qr_points
-                selected_qr_info = [self.last_qr_info] if self.last_qr_info else [""]
+            if tracking_success:
+                tracking_bbox = bbox
+                x, y, w, h = map(int, bbox)
+                
+                # ROIにマージンを追加する
+                margin = int(min(w, h) * 0.2)  # ボックスサイズの20%をマージンとして
+                
+                # マージンを加えたROIの領域を計算（画像の範囲内に収まるように調整）
+                roi_x = max(0, x - margin)
+                roi_y = max(0, y - margin)
+                roi_w = min(frame.shape[1] - roi_x, w + margin * 2)
+                roi_h = min(frame.shape[0] - roi_y, h + margin * 2)
+                
+                # マージンを含むトラッキング領域内でQRコードを再検出
+                roi = frame[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
+                
+                try:
+                    # ROIがframe境界を超えている場合に例外処理
+                    if roi.size > 0:
+                        data, points, _ = self.detector.detectAndDecode(roi)
+                        
+                        if data:
+                            # QRコードが検出された場合は座標を全体のフレームの座標に変換
+                            self.last_qr_info = data
+                            self.last_detection_time = time.time()
+                            self.lost_counter = 0
+                            
+                            # トラッキング範囲内のQRコード座標をフレーム全体の座標に変換
+                            if points is not None:
+                                # マージンを考慮した座標変換
+                                points = points + np.array([[roi_x, roi_y]], dtype=np.float32)
+                                selected_qr_points = points
+                                selected_qr_info = [data]
+                                
+                                # トラッカーを新しい位置で更新
+                                # ポイントをnp.arrayとして確実に変換し、適切な形状にする
+                                points_for_bbox = np.array(points).reshape(-1, 2).astype(np.int32)
+                                new_bbox = cv2.boundingRect(points_for_bbox)
+                                self.tracker = self.create_tracker()
+                                if self.tracker:
+                                    self.tracker.init(frame, new_bbox)
+                        else:
+                            # 検出されなかった場合はトラッキングボックスを輪郭として使用
+                            self.lost_counter += 1
+                            
+                            # トラッキングボックスを元に矩形QRポイントを作成
+                            if self.last_qr_points is not None:
+                                # 形状を保ちつつ位置を更新
+                                old_points = self.last_qr_points.reshape(4, 2)
+                                old_center = np.mean(old_points, axis=0)
+                                
+                                # 新しい中心点を計算
+                                new_center = np.array([x + w/2, y + h/2])
+                                
+                                # 差分ベクトルを計算
+                                diff = new_center - old_center
+                                
+                                # ポイントを移動
+                                new_points = old_points + diff
+                                selected_qr_points = new_points.reshape(4, 1, 2)
+                                selected_qr_info = [self.last_qr_info] if self.last_qr_info else [""]
+                                self.last_qr_points = selected_qr_points
+                except Exception as e:
+                    print(f"トラッキング処理中にエラーが発生しました: {e}")
+                    self.lost_counter += 1
+                
+                # 長時間QRコードが検出されない場合はトラッカーをリセット
+                if self.lost_counter > self.max_lost_frames:
+                    self.tracker = None
+            else:
+                # トラッキング失敗
+                self.tracker = None
         
-        # QRコード境界線を描画
-        qr_overlay = self.draw_qr_boundaries(frame, [selected_qr_points] if selected_qr_points is not None else None, selected_qr_info)
+        # 2. トラッカーがない場合または失敗した場合は全体フレームでQRコードを検出
+        if self.tracker is None:
+            retval, decoded_info, points = self.detect_qr_codes(frame)
+            
+            if retval:
+                self.last_detection_time = time.time()
+                self.lost_counter = 0
+                
+                # 前回検出されたQRコード情報がある場合
+                if self.last_qr_info is not None:
+                    # 前回と同じ内容のQRコードを探す
+                    for i, info in enumerate(decoded_info):
+                        if info == self.last_qr_info:
+                            selected_qr_points = points[i]
+                            selected_qr_info = [info]
+                            break
+                
+                # 前回と同じQRコードが見つからなかった場合は最後のQRコードを使用
+                if selected_qr_points is None and len(points) > 0:
+                    selected_qr_points = points[-1]
+                    selected_qr_info = [decoded_info[-1]]
+                    self.last_qr_info = decoded_info[-1]
+                
+                # 新しいトラッカーを作成
+                if selected_qr_points is not None:
+                    # ポイントをnp.arrayとして確実に変換し、適切な形状にする
+                    try:
+                        points_for_bbox = np.array(selected_qr_points).reshape(-1, 2).astype(np.int32)
+                        bbox = cv2.boundingRect(points_for_bbox)
+                        self.tracker = self.create_tracker()
+                        if self.tracker:
+                            self.tracker.init(frame, bbox)
+                            tracking_bbox = bbox
+                    except Exception as e:
+                        print(f"バウンディングボックスの作成中にエラーが発生しました: {e}")
+                
+                self.last_qr_points = selected_qr_points
+            else:
+                # QRコードが検出されずトラッカーもない場合、直近の座標を使用
+                detection_timeout = 5  # 5秒以内に検出されたもののみ使用
+                if self.last_qr_points is not None and time.time() - self.last_detection_time < detection_timeout:
+                    selected_qr_points = self.last_qr_points
+                    selected_qr_info = [self.last_qr_info] if self.last_qr_info else [""]
         
-        # 透視変換を適用
+        # 3. QRコード境界線とトラッキングボックスを描画
+        qr_overlay = self.draw_qr_boundaries(
+            frame, 
+            [selected_qr_points] if selected_qr_points is not None else None, 
+            selected_qr_info,
+            tracking_bbox
+        )
+        
+        # 4. 透視変換を適用
         perspective_img = self.apply_perspective_transform(frame, selected_qr_points)
         
         return qr_overlay, perspective_img
@@ -403,6 +542,26 @@ class QRPerspectiveDemo:
         """
         if hasattr(self, 'cap') and self.cap.isOpened():
             self.cap.release()
+
+    def create_tracker(self):
+        """
+        OpenCVのトラッカーを作成
+        
+        Returns:
+            作成されたトラッカーオブジェクト、失敗した場合はNone
+        """
+        try:
+            # OpenCV 4.x向けのトラッカー作成方法
+            return cv2.TrackerCSRT_create()
+        except AttributeError:
+            # 古いバージョンのOpenCVやサポートされていない場合の処理
+            print("Warning: TrackerCSRT_create() is not available in this OpenCV version.")
+            try:
+                # 代替トラッカーを試みる
+                return cv2.TrackerKCF_create()
+            except:
+                print("Error: Failed to create any tracker. Tracking will be disabled.")
+                return None
 
 
 def main():
