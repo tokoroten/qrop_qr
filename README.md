@@ -25,6 +25,8 @@ THINKLETは **Google Play Services を持たない** AOSP/Fairy OS 端末のた�
 - **QR検出 → 相対座標で領域切り出し → OCR**
   - QRコードのサイズを1単位とした相対座標 (`x, y, w, h`) でフィールドを定義（[docs/SPEC.md](docs/SPEC.md)）
   - QRの4隅から `Matrix.setPolyToPoly` で透視変換し、フィールド領域だけを正対画像に切り出してOCR
+  - **回転不変**：ファインダパターンでQRシンボルの上方向を判定し、端末/QRを90°・180°回しても
+    フィールド位置が破綻しない（ML Kit cornerPoints は画像基準のため、軽量なピクセル判定で補正）
 - **オフライン OCR**：ML Kit（バンドル版）Text Recognition v2（Latin + Japanese）
 - **オフライン QR検出**：ML Kit（バンドル版）Barcode Scanning
 - **読み上げ (TTS)**：Fairy Josee（`ai.fd.josee.app.tts`、日英オフライン）。未導入時はTTS無効で動作継続
