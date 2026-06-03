@@ -19,7 +19,13 @@ local.properties
 .DS_Store
 Thumbs.db
 
-# Python (testdata generator)
+# Python (testdata / calib tools)
 __pycache__/
 *.pyc
 .venv/
+
+# Calibration capture data / regenerable artifacts（calib.json は残す）
+tools/calib/shots/
+tools/calib/verify/
+tools/calib/chessboard_*.png
+tools/calib/undistort_preview.jpg
