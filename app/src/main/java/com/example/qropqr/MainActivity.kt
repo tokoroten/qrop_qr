@@ -46,6 +46,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -239,6 +240,9 @@ class MainActivity : AppCompatActivity() {
             }
         }
         if (quad != null && spec != null) {
+            // QRシンボル固有の向き(TL,TR,BR,BL)に並べ替え。ML Kit cornerPoints は画像基準の順序
+            // なので、端末を回すとフィールド位置が破綻する。ファインダパターンでQRの上方向を決める。
+            val q = symbolOrderQuad(bmp, quad, now)
             // 魚眼補正: QRの4隅を歪み補正し、補正空間で正しいホモグラフィ(unit→補正画素)を作る。
             // これによりQRから離れたフィールドも正しい位置・形で切り出せる。
             val fe = if (Calib.enabled) Calib.forSize(bmp.width, bmp.height) else null
@@ -248,7 +252,7 @@ class MainActivity : AppCompatActivity() {
             if (fe != null) {
                 val und = FloatArray(8)
                 for (i in 0..3) {
-                    val p = fe.undistortPixel(quad[2 * i].toDouble(), quad[2 * i + 1].toDouble())
+                    val p = fe.undistortPixel(q[2 * i].toDouble(), q[2 * i + 1].toDouble())
                     und[2 * i] = p[0].toFloat(); und[2 * i + 1] = p[1].toFloat()
                 }
                 val hq = Matrix().apply { setPolyToPoly(UNIT, 0, und, 0, 4) }
@@ -262,7 +266,7 @@ class MainActivity : AppCompatActivity() {
                     fieldQuad[2 * i] = p[0].toFloat(); fieldQuad[2 * i + 1] = p[1].toFloat()
                 }
             } else {
-                fieldQuad = fieldFromQuad(quad, spec)
+                fieldQuad = fieldFromQuad(q, spec)
             }
             if (now - lastOcrMs > OCR_MS) {
                 lastOcrMs = now
@@ -282,8 +286,8 @@ class MainActivity : AppCompatActivity() {
                     saveJpeg(crop, File(getExternalFilesDir(null), "crop.jpg"))
                 }
             }
-            if (fe != null && undField != null) drawOverlayCurved(bmp, quad, undField, fe, fieldQuad, lastLabel)
-            else drawOverlay(bmp, quad, fieldQuad, lastLabel)
+            if (fe != null && undField != null) drawOverlayCurved(bmp, q, undField, fe, fieldQuad, lastLabel)
+            else drawOverlay(bmp, q, fieldQuad, lastLabel)
         } else {
             drawStatus(bmp, "QRをかざしてください")
         }
@@ -309,6 +313,90 @@ class MainActivity : AppCompatActivity() {
                 j.getDouble("x").toFloat(), j.getDouble("y").toFloat(), j.getDouble("w").toFloat(), j.getDouble("h").toFloat()
             )
         } catch (e: Exception) { null }
+    }
+
+    // QRシンボルの向き（画像座標での x軸=右, y軸=下 の単位ベクトル）をキャッシュ。
+    private var orValid = false
+    private var orXdx = 1f; private var orXdy = 0f
+    private var orYdx = 0f; private var orYdy = 1f
+    private var lastOrientMs = 0L
+    private val orMat = Matrix()
+    private val orMv = FloatArray(9)
+
+    /**
+     * ML Kit cornerPoints は画像基準（常に画像TLから時計回り）でシンボルの向きを含まない。
+     * 4隅のファインダパターン有無を“数十点のピクセル読み取り”だけで判定し、ファインダの無い隅=BR
+     * を特定→シンボルの上方向を求めて 4隅を [TL,TR,BR,BL]（シンボル基準）に並べ替える。
+     * 向き更新は ORIENT_MS 間隔、各フレームはキャッシュ軸で分類するだけ（ほぼ無コスト）。
+     */
+    private fun symbolOrderQuad(bmp: Bitmap, quad: FloatArray, now: Long): FloatArray {
+        if (now - lastOrientMs > ORIENT_MS) { lastOrientMs = now; updateSymbolAxes(bmp, quad) }
+        if (!orValid) return quad
+        var cx = 0f; var cy = 0f
+        for (i in 0..3) { cx += quad[2 * i]; cy += quad[2 * i + 1] }
+        cx /= 4; cy /= 4
+        var tl = 0; var tr = 0; var br = 0; var bl = 0
+        var tlV = Float.MAX_VALUE; var brV = -Float.MAX_VALUE
+        var trV = -Float.MAX_VALUE; var blV = Float.MAX_VALUE
+        for (i in 0..3) {
+            val dx = quad[2 * i] - cx; val dy = quad[2 * i + 1] - cy
+            val sx = dx * orXdx + dy * orXdy   // シンボル右方向への射影
+            val sy = dx * orYdx + dy * orYdy   // シンボル下方向への射影
+            if (sx + sy < tlV) { tlV = sx + sy; tl = i }   // 左上=右も下も小
+            if (sx + sy > brV) { brV = sx + sy; br = i }   // 右下=右も下も大
+            if (sx - sy > trV) { trV = sx - sy; tr = i }   // 右上=右大・下小
+            if (sx - sy < blV) { blV = sx - sy; bl = i }   // 左下=右小・下大
+        }
+        return floatArrayOf(quad[2 * tl], quad[2 * tl + 1], quad[2 * tr], quad[2 * tr + 1],
+            quad[2 * br], quad[2 * br + 1], quad[2 * bl], quad[2 * bl + 1])
+    }
+
+    /** 4隅のファインダらしさを比較→BR(最小)を決め、シンボル軸を更新（軽量・getPixelのみ）。 */
+    private fun updateSymbolAxes(bmp: Bitmap, quad: FloatArray) {
+        orMat.setPolyToPoly(UNIT, 0, quad, 0, 4)
+        orMat.getValues(orMv)
+        var brK = 0; var brScore = Double.MAX_VALUE
+        for (k in 0..3) {
+            val s = finderness(bmp, k)
+            if (s < brScore) { brScore = s; brK = k }
+        }
+        // ML Kit順は画像CW [TL,TR,BR,BL]。BRの対角がTL、CW隣接でTR/BLが決まる。
+        val tlK = (brK + 2) % 4; val trK = (brK + 3) % 4; val blK = (brK + 1) % 4
+        if (DBG_ORIENT) Log.i(TAG, "ORIENT brK=$brK (0=imgTL,1=TR,2=BR,3=BL) → tlK=$tlK")
+        val xdx = quad[2 * trK] - quad[2 * tlK]; val xdy = quad[2 * trK + 1] - quad[2 * tlK + 1]
+        val ydx = quad[2 * blK] - quad[2 * tlK]; val ydy = quad[2 * blK + 1] - quad[2 * tlK + 1]
+        val xl = hypot(xdx.toDouble(), xdy.toDouble()).toFloat()
+        val yl = hypot(ydx.toDouble(), ydy.toDouble()).toFloat()
+        if (xl < 1f || yl < 1f) return
+        orXdx = xdx / xl; orXdy = xdy / xl; orYdx = ydx / yl; orYdy = ydy / yl; orValid = true
+    }
+
+    /** 隅kのファインダらしさ。中心=暗, 中ﾘﾝｸﾞ=明, 外周=暗（1:1:3:1:1）をモジュール数不明でも多scaleで評価。 */
+    private fun finderness(bmp: Bitmap, k: Int): Double {
+        var best = -Double.MAX_VALUE
+        for (f in FINDER_FRACS) {
+            val center = sampleFinder(bmp, k, f, 0.5f, 0.5f)
+            val light = (sampleFinder(bmp, k, f, 0.214f, 0.5f) + sampleFinder(bmp, k, f, 0.786f, 0.5f) +
+                sampleFinder(bmp, k, f, 0.5f, 0.214f) + sampleFinder(bmp, k, f, 0.5f, 0.786f)) / 4.0
+            val outer = (sampleFinder(bmp, k, f, 0.071f, 0.5f) + sampleFinder(bmp, k, f, 0.929f, 0.5f) +
+                sampleFinder(bmp, k, f, 0.5f, 0.071f) + sampleFinder(bmp, k, f, 0.5f, 0.929f)) / 4.0
+            val sc = (255 - center) + light + (255 - outer)
+            if (sc > best) best = sc
+        }
+        return best
+    }
+
+    /** ファインダ内の正規化座標(a,b∈[0,1])を、隅kに合わせてunit→画像へ写し輝度を返す。 */
+    private fun sampleFinder(bmp: Bitmap, k: Int, f: Float, a: Float, b: Float): Int {
+        val uu = if (k == 1 || k == 2) 1f - a * f else a * f
+        val vv = if (k == 2 || k == 3) 1f - b * f else b * f
+        val den = orMv[6] * uu + orMv[7] * vv + orMv[8]
+        val x = (orMv[0] * uu + orMv[1] * vv + orMv[2]) / den
+        val y = (orMv[3] * uu + orMv[4] * vv + orMv[5]) / den
+        val xi = x.toInt().coerceIn(0, bmp.width - 1)
+        val yi = y.toInt().coerceIn(0, bmp.height - 1)
+        val p = bmp.getPixel(xi, yi)
+        return ((p shr 16 and 0xff) + (p shr 8 and 0xff) + (p and 0xff)) / 3
     }
 
     private fun fieldFromQuad(qrQuad: FloatArray, s: Spec): FloatArray {
@@ -473,6 +561,8 @@ class MainActivity : AppCompatActivity() {
         private const val TTS_ENGINE = "ai.fd.josee.app.tts"  // Fairy Josee（オフライン日英TTS）。未導入時はTTS無効
         private const val OCR_MS = 600L
         private const val SHOW_MS = 80L
+        private const val ORIENT_MS = 250L    // 向き軸を更新する間隔（毎フレームの分類はキャッシュ軸で軽量）
+        private const val DBG_ORIENT = false  // 検証用：判定したBR隅をログ出力
         private const val MIN_EXP_NS = 250_000L     // 1/4000s（明るい場面の下限）
         private const val MAX_EXP_NS = 16_000_000L  // 1/62s（ブラー抑制の上限＝暗所でもこれ以上は開けない）
 
@@ -484,5 +574,8 @@ class MainActivity : AppCompatActivity() {
 
         // QRサイズの単位正方形（TL,TR,BR,BL）。ML Kit cornerPoints の並びに一致。
         private val UNIT = floatArrayOf(0f, 0f, 1f, 0f, 1f, 1f, 0f, 1f)
+
+        // ファインダ占有率 7/M（M=モジュール数, QR ver1-6: 21..41）。モジュール数不明でも多scaleで評価。
+        private val FINDER_FRACS = floatArrayOf(7f / 21, 7f / 25, 7f / 29, 7f / 33, 7f / 37, 7f / 41)
     }
 }
