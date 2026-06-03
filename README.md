@@ -30,6 +30,7 @@ THINKLETは **Google Play Services を持たない** AOSP/Fairy OS 端末のた�
 - **オフライン OCR**：ML Kit（バンドル版）Text Recognition v2（Latin + Japanese）
 - **オフライン QR検出**：ML Kit（バンドル版）Barcode Scanning
 - **読み上げ (TTS)**：Fairy Josee（`ai.fd.josee.app.tts`、日英オフライン）。未導入時はTTS無効で動作継続
+- **端末内HTTPビューア**：OCR結果をブラウザでライブ確認＋蓄積閲覧（依存ライブラリなしの内蔵HTTPサーバ。後述）
 - **モーションブラー対策**：Camera2 manual sensor によるアダプティブ高速シャッター
   - 露光時間の上限を **1/62s (`MAX_EXP_NS`)** に固定し、明るさを測りながらブラーを抑えつつ露出を自動調整（QRはブラーに弱いため）
 - **3分割UI**：上＝カメラLive＋認識枠（QR=緑 / フィールド=シアン）、中＝切り出した透視変換画像、下＝OCR結果文字列
@@ -56,14 +57,39 @@ adb install -r josee-tts-*.apk
 adb shell settings put secure tts_default_synth ai.fd.josee.app.tts
 ```
 
+### 端末内HTTPビューア
+
+THINKLETには見やすい画面が無いため、OCR結果を外部ブラウザで確認できる軽量HTTPサーバを内蔵しています（ポート `8080`、依存ライブラリなし＝GMS非依存を維持）。読み取るたびに値が1行ずつ蓄積され、「貯まっていく」様子をそのまま見せられます。
+
+```bash
+# USB接続のみで見る（同一LAN不要）
+adb forward tcp:8080 tcp:8080
+# → ブラウザで http://localhost:8080
+
+# 同一WiFiのPC/タブレットから見る場合は端末IP（起動ログ "HTTP listening on :8080 -> ..." を参照）
+# → http://<端末IP>:8080
+```
+
+| エンドポイント | 内容 |
+| --- | --- |
+| `GET /` | ライブ確認（最新の切り出し画像＋認識値）＋蓄積テーブル（~700msで自動更新） |
+| `GET /records` | 蓄積テーブルのスナップショット（サーバ描画・印刷向け） |
+| `GET /records.json` | 機械可読JSON（将来のDB連携／外部POSTへの橋渡し） |
+| `GET /state.json` | ライブ画面用（最新値＋全レコード） |
+| `GET /crop.jpg` | 最新の切り出し画像（JPEG） |
+
+> 注: 本サーバは**デモ・検証用**の「端末＝サーバ」構成です。本番のConnected Worker構成では「端末＝クライアント→収集サーバ→DB」と逆向きになります。`/records.json` を用意してあるので、その移行（外部エンドポイントへのPOST）は容易です。
+
 ### テスト用フォーム
 
 [testdata/](testdata/) にサンプルフォーム（QR＋OCR対象テキスト）があります。
 
 - `form_en.png` … `CQR1,name,en,1.2,0,8,1` ＋ "Yamada Taro"
 - `form_ja.png` … `CQR1,user_name,ja_jp,1.2,0,8,1` ＋ "なかやま しんた"
+- `form_multi.png` … **マルチ読み取り（複数QR＝1QR1フィールド）サンプル**。様々な大きさ・オフセット（右/下/左/上, 負値含む）のQR＋読み取り領域を6つ並べたA4縦帳票（`make_multiform.py`）。
+  各フィールドのダミー値: `INV-2026-0042` / `なかやま しんた` / `1600 Amphitheatre Pkwy` / `2026-06-04` / `東京都千代田区一番町` / `A-7F3K-99Z`
 
-`testdata/make_form.py` で再生成できます（`pip install qrcode pillow`）。
+`testdata/make_form.py` ／ `testdata/make_multiform.py` で再生成できます（`pip install qrcode pillow`）。
 
 ## 特許
 - 本実装は、富士通が保有していた特許第４３９８４７４号に酷似しています

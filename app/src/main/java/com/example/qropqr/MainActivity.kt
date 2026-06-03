@@ -63,7 +63,11 @@ class MainActivity : AppCompatActivity() {
     private val busy = AtomicBoolean(false)
     private var lastOcrMs = 0L
     private var lastShowMs = 0L
-    @Volatile private var lastLabel = ""
+
+    // マルチQR用の状態（フィールド名で管理）
+    private val fieldValues = java.util.concurrent.ConcurrentHashMap<String, String>()  // name -> 最新OCR値
+    private val orientCache = HashMap<String, Pair<Int, Long>>()                         // name -> (brK, ts) QRごとの向き
+    private val lastOcrByName = HashMap<String, Long>()                                  // name -> 最終OCR時刻（公平なRR）
 
     // アダプティブ露出
     private var camCtl: Camera2CameraControl? = null
@@ -85,6 +89,9 @@ class MainActivity : AppCompatActivity() {
     private var ttsReady = false
     @Volatile private var lastSpoken = ""
 
+    // 端末内蔵HTTPサーバ（OCR結果をブラウザでライブ確認＋蓄積閲覧）
+    private val httpServer = OcrHttpServer(HTTP_PORT)
+
     private val barcodeScanner = BarcodeScanning.getClient(
         BarcodeScannerOptions.Builder().setBarcodeFormats(Barcode.FORMAT_QR_CODE).build()
     )
@@ -96,6 +103,8 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
         previewView = findViewById(R.id.preview)
         cropView = findViewById(R.id.crop)
+        httpServer.start()
+        Log.i(TAG, "HTTP: ${httpServer.urls().joinToString("  /  ")}")
         tts = TextToSpeech(this, { st ->
             ttsReady = (st == TextToSpeech.SUCCESS)
             Log.i(TAG, "TTS init=$ttsReady engine=${runCatching { tts?.defaultEngine }.getOrNull()}")
@@ -217,6 +226,12 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** 1QRぶんの描画・切り出し情報（QRごとに独立。複数QRを同時に扱う）。 */
+    private class FieldDraw(
+        val qrQuad: FloatArray, val spec: Spec, val fieldQuad: FloatArray,
+        val hqUndist: Matrix?, val undField: FloatArray?
+    )
+
     private fun process(bmp: Bitmap) {
         val now = SystemClock.elapsedRealtime()
         maybeAdjustExposure(bmp, now)
@@ -226,74 +241,91 @@ class MainActivity : AppCompatActivity() {
             return
         }
         val barcodes = Tasks.await(barcodeScanner.process(InputImage.fromBitmap(bmp, 0)))
-        var quad: FloatArray? = null
-        var spec: Spec? = null
+        val fe = if (Calib.enabled) Calib.forSize(bmp.width, bmp.height) else null
+
+        // 検出した全QRを処理：QRごとに向きを判定し、フィールド領域を計算
+        val fields = ArrayList<FieldDraw>()
         for (b in barcodes) {
-            val s = b.rawValue?.let { parseSpec(it) }
-            val cp = b.cornerPoints
-            if (s != null && cp?.size == 4) {
-                quad = floatArrayOf(
-                    cp[0].x.toFloat(), cp[0].y.toFloat(), cp[1].x.toFloat(), cp[1].y.toFloat(),
-                    cp[2].x.toFloat(), cp[2].y.toFloat(), cp[3].x.toFloat(), cp[3].y.toFloat()
-                )
-                spec = s; break
-            }
+            val s = b.rawValue?.let { parseSpec(it) } ?: continue
+            val cp = b.cornerPoints ?: continue
+            if (cp.size != 4) continue
+            val quad = floatArrayOf(
+                cp[0].x.toFloat(), cp[0].y.toFloat(), cp[1].x.toFloat(), cp[1].y.toFloat(),
+                cp[2].x.toFloat(), cp[2].y.toFloat(), cp[3].x.toFloat(), cp[3].y.toFloat()
+            )
+            // QRシンボル固有の向き(TL,TR,BR,BL)に並べ替え（QRごとに独立判定＝混線しない）
+            val q = orderQuadBySymbol(bmp, quad, s.name, now)
+            fields.add(buildField(bmp, q, s, fe))
         }
-        if (quad != null && spec != null) {
-            // QRシンボル固有の向き(TL,TR,BR,BL)に並べ替え。ML Kit cornerPoints は画像基準の順序
-            // なので、端末を回すとフィールド位置が破綻する。ファインダパターンでQRの上方向を決める。
-            val q = symbolOrderQuad(bmp, quad, now)
-            // 魚眼補正: QRの4隅を歪み補正し、補正空間で正しいホモグラフィ(unit→補正画素)を作る。
-            // これによりQRから離れたフィールドも正しい位置・形で切り出せる。
-            val fe = if (Calib.enabled) Calib.forSize(bmp.width, bmp.height) else null
-            var hqUndist: Matrix? = null
-            var undField: FloatArray? = null
-            val fieldQuad: FloatArray
-            if (fe != null) {
-                val und = FloatArray(8)
-                for (i in 0..3) {
-                    val p = fe.undistortPixel(q[2 * i].toDouble(), q[2 * i + 1].toDouble())
-                    und[2 * i] = p[0].toFloat(); und[2 * i + 1] = p[1].toFloat()
-                }
-                val hq = Matrix().apply { setPolyToPoly(UNIT, 0, und, 0, 4) }
-                val uf = floatArrayOf(spec.x, spec.y, spec.x + spec.w, spec.y, spec.x + spec.w, spec.y + spec.h, spec.x, spec.y + spec.h)
-                hq.mapPoints(uf)
-                hqUndist = hq; undField = uf
-                // オーバーレイ用に、補正空間のフィールド隅を歪み画素へ戻す
-                fieldQuad = FloatArray(8)
-                for (i in 0..3) {
-                    val p = fe.distortPixel(uf[2 * i].toDouble(), uf[2 * i + 1].toDouble())
-                    fieldQuad[2 * i] = p[0].toFloat(); fieldQuad[2 * i + 1] = p[1].toFloat()
-                }
-            } else {
-                fieldQuad = fieldFromQuad(q, spec)
-            }
+
+        if (fields.isNotEmpty()) {
+            // OCRは1ティック1フィールドのラウンドロビン（検出/枠描画は毎フレーム、OCRだけ間引いて速度確保）。
+            // 公平性のため「最も長くOCRしていないフィールド」を選ぶ。
             if (now - lastOcrMs > OCR_MS) {
                 lastOcrMs = now
-                val crop = if (hqUndist != null && fe != null) warpCropUndistort(bmp, hqUndist, spec, fe)
-                           else warpCrop(bmp, fieldQuad, spec.w, spec.h)
-                if (crop != null) {
-                    val name = spec.name
-                    val lang = spec.language
-                    val rec = if (lang.startsWith("ja")) ocrJa else ocrLatin
-                    rec.process(InputImage.fromBitmap(crop, 0)).addOnSuccessListener { res ->
-                        val text = res.text.trim().replace("\n", " ")
-                        if (text.isNotEmpty()) { lastLabel = "$name: $text"; speak(name, text, lang) }
-                        Log.i(TAG, "RESULT  {\"$name\":\"$text\"}")
-                        cropView.setImageBitmap(crop)
-                        bottomText()?.text = if (lastLabel.isNotEmpty()) lastLabel else name
-                    }
-                    saveJpeg(crop, File(getExternalFilesDir(null), "crop.jpg"))
-                }
+                val f = fields.minByOrNull { lastOcrByName[it.spec.name] ?: 0L }!!
+                lastOcrByName[f.spec.name] = now
+                ocrField(bmp, f, fe)
             }
-            if (fe != null && undField != null) drawOverlayCurved(bmp, q, undField, fe, fieldQuad, lastLabel)
-            else drawOverlay(bmp, q, fieldQuad, lastLabel)
+            // すべてのフィールドの枠を毎フレーム描画
+            for (f in fields) {
+                if (fe != null && f.undField != null) drawOverlayCurved(bmp, f.qrQuad, f.undField, fe, f.fieldQuad, labelFor(f.spec.name))
+                else drawOverlay(bmp, f.qrQuad, f.fieldQuad, labelFor(f.spec.name))
+            }
         } else {
             drawStatus(bmp, "QRをかざしてください")
         }
         drawExpHud(bmp)
         if (now - lastShowMs > SHOW_MS) { lastShowMs = now; showPreview(bmp) }
     }
+
+    /** QRの並び替え済み4隅とspecから、フィールド領域（魚眼補正あり/なし）を構築。 */
+    private fun buildField(bmp: Bitmap, q: FloatArray, spec: Spec, fe: Fisheye?): FieldDraw {
+        if (fe != null) {
+            // 魚眼補正: QRの4隅を歪み補正→補正空間で unit→補正画素のホモグラフィ→フィールド隅を求める。
+            val und = FloatArray(8)
+            for (i in 0..3) {
+                val p = fe.undistortPixel(q[2 * i].toDouble(), q[2 * i + 1].toDouble())
+                und[2 * i] = p[0].toFloat(); und[2 * i + 1] = p[1].toFloat()
+            }
+            val hq = Matrix().apply { setPolyToPoly(UNIT, 0, und, 0, 4) }
+            val uf = floatArrayOf(spec.x, spec.y, spec.x + spec.w, spec.y, spec.x + spec.w, spec.y + spec.h, spec.x, spec.y + spec.h)
+            hq.mapPoints(uf)
+            // オーバーレイ用に、補正空間のフィールド隅を歪み画素へ戻す
+            val fq = FloatArray(8)
+            for (i in 0..3) {
+                val p = fe.distortPixel(uf[2 * i].toDouble(), uf[2 * i + 1].toDouble())
+                fq[2 * i] = p[0].toFloat(); fq[2 * i + 1] = p[1].toFloat()
+            }
+            return FieldDraw(q, spec, fq, hq, uf)
+        }
+        return FieldDraw(q, spec, fieldFromQuad(q, spec), null, null)
+    }
+
+    /** 1フィールドを切り出してOCR。結果はフィールド名で蓄積し、値が変わった時だけ読み上げ＆記録。 */
+    private fun ocrField(bmp: Bitmap, f: FieldDraw, fe: Fisheye?) {
+        val crop = if (f.hqUndist != null && fe != null) warpCropUndistort(bmp, f.hqUndist, f.spec, fe)
+                   else warpCrop(bmp, f.fieldQuad, f.spec.w, f.spec.h)
+        crop ?: return
+        val name = f.spec.name
+        val lang = f.spec.language
+        val rec = if (lang.startsWith("ja")) ocrJa else ocrLatin
+        rec.process(InputImage.fromBitmap(crop, 0)).addOnSuccessListener { res ->
+            val text = res.text.trim().replace("\n", " ")
+            if (text.isNotEmpty()) {
+                val changed = fieldValues.put(name, text) != text
+                cropView.setImageBitmap(crop)
+                bottomText()?.text = fieldValues.entries.joinToString("\n") { "${it.key}: ${it.value}" }
+                httpServer.publish(name, text, lang, jpegBytes(crop), System.currentTimeMillis())
+                if (changed) speak(name, text, lang)
+            }
+            Log.i(TAG, "RESULT  {\"$name\":\"$text\"}")
+        }
+        saveJpeg(crop, File(getExternalFilesDir(null), "crop.jpg"))
+    }
+
+    /** オーバーレイのラベル。OCR済みなら "name: 値"、未OCRなら name。 */
+    private fun labelFor(name: String): String = fieldValues[name]?.let { "$name: $it" } ?: name
 
     private data class Spec(val name: String, val language: String, val x: Float, val y: Float, val w: Float, val h: Float)
 
@@ -315,60 +347,38 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) { null }
     }
 
-    // QRシンボルの向き（画像座標での x軸=右, y軸=下 の単位ベクトル）をキャッシュ。
-    private var orValid = false
-    private var orXdx = 1f; private var orXdy = 0f
-    private var orYdx = 0f; private var orYdy = 1f
-    private var lastOrientMs = 0L
+    // QRシンボルの向き判定用の再利用テンポラリ（camExec単一スレッドで逐次使用）。
     private val orMat = Matrix()
     private val orMv = FloatArray(9)
 
     /**
      * ML Kit cornerPoints は画像基準（常に画像TLから時計回り）でシンボルの向きを含まない。
      * 4隅のファインダパターン有無を“数十点のピクセル読み取り”だけで判定し、ファインダの無い隅=BR
-     * を特定→シンボルの上方向を求めて 4隅を [TL,TR,BR,BL]（シンボル基準）に並べ替える。
-     * 向き更新は ORIENT_MS 間隔、各フレームはキャッシュ軸で分類するだけ（ほぼ無コスト）。
+     * を特定→4隅を [TL,TR,BR,BL]（シンボル基準）に並べ替える。
+     *
+     * 判定はQRごと（name でキャッシュ）に ORIENT_MS 間隔で更新。複数QRがあっても各QRが自分の
+     * 向きだけを持つので、別QRの軸が混線してフィールドがズレることがない。
      */
-    private fun symbolOrderQuad(bmp: Bitmap, quad: FloatArray, now: Long): FloatArray {
-        if (now - lastOrientMs > ORIENT_MS) { lastOrientMs = now; updateSymbolAxes(bmp, quad) }
-        if (!orValid) return quad
-        var cx = 0f; var cy = 0f
-        for (i in 0..3) { cx += quad[2 * i]; cy += quad[2 * i + 1] }
-        cx /= 4; cy /= 4
-        var tl = 0; var tr = 0; var br = 0; var bl = 0
-        var tlV = Float.MAX_VALUE; var brV = -Float.MAX_VALUE
-        var trV = -Float.MAX_VALUE; var blV = Float.MAX_VALUE
-        for (i in 0..3) {
-            val dx = quad[2 * i] - cx; val dy = quad[2 * i + 1] - cy
-            val sx = dx * orXdx + dy * orXdy   // シンボル右方向への射影
-            val sy = dx * orYdx + dy * orYdy   // シンボル下方向への射影
-            if (sx + sy < tlV) { tlV = sx + sy; tl = i }   // 左上=右も下も小
-            if (sx + sy > brV) { brV = sx + sy; br = i }   // 右下=右も下も大
-            if (sx - sy > trV) { trV = sx - sy; tr = i }   // 右上=右大・下小
-            if (sx - sy < blV) { blV = sx - sy; bl = i }   // 左下=右小・下大
-        }
-        return floatArrayOf(quad[2 * tl], quad[2 * tl + 1], quad[2 * tr], quad[2 * tr + 1],
-            quad[2 * br], quad[2 * br + 1], quad[2 * bl], quad[2 * bl + 1])
-    }
-
-    /** 4隅のファインダらしさを比較→BR(最小)を決め、シンボル軸を更新（軽量・getPixelのみ）。 */
-    private fun updateSymbolAxes(bmp: Bitmap, quad: FloatArray) {
-        orMat.setPolyToPoly(UNIT, 0, quad, 0, 4)
-        orMat.getValues(orMv)
-        var brK = 0; var brScore = Double.MAX_VALUE
-        for (k in 0..3) {
-            val s = finderness(bmp, k)
-            if (s < brScore) { brScore = s; brK = k }
+    private fun orderQuadBySymbol(bmp: Bitmap, quad: FloatArray, name: String, now: Long): FloatArray {
+        val cached = orientCache[name]
+        val brK = if (cached != null && now - cached.second < ORIENT_MS) {
+            cached.first
+        } else {
+            orMat.setPolyToPoly(UNIT, 0, quad, 0, 4)
+            orMat.getValues(orMv)
+            var k = 0; var best = Double.MAX_VALUE
+            val sc = DoubleArray(4)
+            for (i in 0..3) { sc[i] = finderness(bmp, i); if (sc[i] < best) { best = sc[i]; k = i } }
+            if (DBG_ORIENT) Log.i(TAG, "ORIENT[$name] sc=[%.0f,%.0f,%.0f,%.0f] brK=%d".format(sc[0], sc[1], sc[2], sc[3], k))
+            orientCache[name] = Pair(k, now)
+            k
         }
         // ML Kit順は画像CW [TL,TR,BR,BL]。BRの対角がTL、CW隣接でTR/BLが決まる。
         val tlK = (brK + 2) % 4; val trK = (brK + 3) % 4; val blK = (brK + 1) % 4
-        if (DBG_ORIENT) Log.i(TAG, "ORIENT brK=$brK (0=imgTL,1=TR,2=BR,3=BL) → tlK=$tlK")
-        val xdx = quad[2 * trK] - quad[2 * tlK]; val xdy = quad[2 * trK + 1] - quad[2 * tlK + 1]
-        val ydx = quad[2 * blK] - quad[2 * tlK]; val ydy = quad[2 * blK + 1] - quad[2 * tlK + 1]
-        val xl = hypot(xdx.toDouble(), xdy.toDouble()).toFloat()
-        val yl = hypot(ydx.toDouble(), ydy.toDouble()).toFloat()
-        if (xl < 1f || yl < 1f) return
-        orXdx = xdx / xl; orXdy = xdy / xl; orYdx = ydx / yl; orYdy = ydy / yl; orValid = true
+        return floatArrayOf(
+            quad[2 * tlK], quad[2 * tlK + 1], quad[2 * trK], quad[2 * trK + 1],
+            quad[2 * brK], quad[2 * brK + 1], quad[2 * blK], quad[2 * blK + 1]
+        )
     }
 
     /** 隅kのファインダらしさ。中心=暗, 中ﾘﾝｸﾞ=明, 外周=暗（1:1:3:1:1）をモジュール数不明でも多scaleで評価。 */
@@ -536,6 +546,12 @@ class MainActivity : AppCompatActivity() {
         runCatching { FileOutputStream(file).use { bmp.compress(Bitmap.CompressFormat.JPEG, 90, it) } }
     }
 
+    private fun jpegBytes(bmp: Bitmap): ByteArray {
+        val bos = java.io.ByteArrayOutputStream()
+        bmp.compress(Bitmap.CompressFormat.JPEG, 85, bos)
+        return bos.toByteArray()
+    }
+
     private fun bottomText(): TextView? = findViewById(R.id.text)
     private fun ui(msg: String) { runOnUiThread { bottomText()?.text = msg } }
 
@@ -552,13 +568,14 @@ class MainActivity : AppCompatActivity() {
         t.speak(text, TextToSpeech.QUEUE_FLUSH, null, "qr")
     }
 
-    override fun onDestroy() { tts?.stop(); tts?.shutdown(); camExec.shutdown(); super.onDestroy() }
+    override fun onDestroy() { httpServer.stop(); tts?.stop(); tts?.shutdown(); camExec.shutdown(); super.onDestroy() }
 
     companion object {
         private const val TAG = "QropQR"
         private const val TTS_ENGINE = "ai.fd.josee.app.tts"  // Fairy Josee（オフライン日英TTS）。未導入時はTTS無効
         private const val OCR_MS = 600L
         private const val SHOW_MS = 80L
+        private const val HTTP_PORT = 8080  // 端末内HTTPサーバ。adb forward tcp:8080 tcp:8080 でPCから閲覧可
         private const val ORIENT_MS = 250L    // 向き軸を更新する間隔（毎フレームの分類はキャッシュ軸で軽量）
         private const val DBG_ORIENT = false  // 検証用：判定したBR隅をログ出力
         private const val MIN_EXP_NS = 250_000L     // 1/4000s（明るい場面の下限）
