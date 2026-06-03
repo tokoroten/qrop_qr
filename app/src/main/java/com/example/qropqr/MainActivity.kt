@@ -539,19 +539,17 @@ class MainActivity : AppCompatActivity() {
     private fun bottomText(): TextView? = findViewById(R.id.text)
     private fun ui(msg: String) { runOnUiThread { bottomText()?.text = msg } }
 
-    /** カラム名＋認識値を読み上げ（例「user name. なかやま しんた」）。同じ内容の連呼は抑制。 */
+    /** 認識値を読み上げ（同じ値の連呼は抑制）。カラム名は読まない（日本語TTSが英字を1字ずつ読むため）。 */
     private fun speak(name: String, text: String, lang: String) {
         val t = tts ?: return
-        if (!ttsReady || text.isEmpty()) return
-        val spoken = "${name.replace("_", " ")}. $text"   // user_name → "user name"（TTSが読みやすい）
-        if (spoken == lastSpoken) return
+        if (!ttsReady || text.isEmpty() || text == lastSpoken) return
         val locale = if (lang.startsWith("ja")) Locale.JAPANESE else Locale.US
         val r = t.setLanguage(locale)
         if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) {
             Log.w(TAG, "TTS: $locale 非対応（既定Picoは日本語不可。josee/mimi導入が必要）"); return
         }
-        lastSpoken = spoken
-        t.speak(spoken, TextToSpeech.QUEUE_FLUSH, null, "qr")
+        lastSpoken = text
+        t.speak(text, TextToSpeech.QUEUE_FLUSH, null, "qr")
     }
 
     override fun onDestroy() { tts?.stop(); tts?.shutdown(); camExec.shutdown(); super.onDestroy() }
