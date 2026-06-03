@@ -1,0 +1,25 @@
+# Android / Gradle
+*.iml
+.gradle/
+**/build/
+/captures
+.externalNativeBuild
+.cxx/
+*.apk
+*.aab
+
+# Local config
+local.properties
+
+# IDE
+.idea/
+*.hprof
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python (testdata generator)
+__pycache__/
+*.pyc
+.venv/
