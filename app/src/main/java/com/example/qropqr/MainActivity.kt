@@ -17,6 +17,7 @@ import android.speech.tts.TextToSpeech
 import android.util.Log
 import java.util.Locale
 import android.util.Size
+import android.view.KeyEvent
 import android.widget.ImageView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
@@ -76,9 +77,12 @@ class MainActivity : AppCompatActivity() {
     private var expHi = 16_000_000L
     private var lastExpMs = 0L
 
-    // キャリブ撮影モード（CALIB_CAPTURE=true でビルドした時のみ動作）
+    // 魚眼キャリブ撮影モード（音量↑＋↓の同時押しで実行時にON/OFF）
+    @Volatile private var calibMode = false
     private var calibCount = 0
     private var lastCalibMs = 0L
+    private val keysDown = HashSet<Int>()   // 物理キーの同時押し判定用
+    private var chordFired = false          // chord発火済みフラグ（キーリピートの再発火抑制）
 
     private lateinit var previewView: ImageView
     private lateinit var cropView: ImageView
@@ -126,6 +130,42 @@ class MainActivity : AppCompatActivity() {
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) startCamera()
+    }
+
+    // THINKLETはタッチ操作が無いため、物理キーの「音量↑＋音量↓ 同時押し」を隠しコマンドとして
+    // 魚眼キャリブ撮影モードのON/OFFに使う（再ビルド不要）。単独押しは通常の音量動作を残す。
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        keysDown.add(keyCode)
+        val chord = keysDown.contains(KeyEvent.KEYCODE_VOLUME_UP) && keysDown.contains(KeyEvent.KEYCODE_VOLUME_DOWN)
+        if (chord && !chordFired) { chordFired = true; toggleCalibMode(); return true }
+        if (chord) return true   // chord保持中は音量変化を抑制
+        return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
+        keysDown.remove(keyCode)
+        if (!(keysDown.contains(KeyEvent.KEYCODE_VOLUME_UP) && keysDown.contains(KeyEvent.KEYCODE_VOLUME_DOWN))) chordFired = false
+        return super.onKeyUp(keyCode, event)
+    }
+
+    /** キャリブ撮影モードのトグル。入る時はカウンタをリセットしTTSで案内。 */
+    private fun toggleCalibMode() {
+        calibMode = !calibMode
+        if (calibMode) {
+            calibCount = 0; lastCalibMs = 0L
+            announce("キャリブレーションモードを開始します。チェスボードを傾けて見せてください")
+        } else {
+            announce("キャリブレーションを中止しました")
+        }
+        Log.i(TAG, "calibMode=$calibMode (volume up+down chord)")
+    }
+
+    /** 状態アナウンス（連呼抑制せず即読み上げ。日本語固定）。 */
+    private fun announce(text: String) {
+        val t = tts ?: return
+        if (!ttsReady) return
+        t.setLanguage(Locale.JAPANESE)
+        t.speak(text, TextToSpeech.QUEUE_FLUSH, null, "announce")
     }
 
     private fun startCamera() {
@@ -240,7 +280,7 @@ class MainActivity : AppCompatActivity() {
     private fun process(bmp: Bitmap) {
         val now = SystemClock.elapsedRealtime()
         maybeAdjustExposure(bmp, now)
-        if (CALIB_CAPTURE) {
+        if (calibMode) {
             runCalibCapture(bmp, now)
             if (now - lastShowMs > SHOW_MS) { lastShowMs = now; showPreview(bmp) }
             return
@@ -518,22 +558,23 @@ class MainActivity : AppCompatActivity() {
             Paint().apply { color = Color.YELLOW; textSize = 54f; isAntiAlias = true; setShadowLayer(6f, 0f, 0f, Color.BLACK) })
     }
 
-    /** キャリブ用：解析フレーム(オーバーレイ前)を一定間隔で external files/calib に保存。 */
+    /** キャリブ撮影：解析フレーム(オーバーレイ前)を一定間隔で external files/calib に保存。N枚で自動終了。 */
     private fun runCalibCapture(bmp: Bitmap, now: Long) {
-        if (calibCount < CALIB_MAX && now - lastCalibMs > CALIB_INTERVAL_MS) {
+        if (now - lastCalibMs > CALIB_INTERVAL_MS) {
             lastCalibMs = now
             val dir = File(getExternalFilesDir(null), "calib").apply { mkdirs() }
             saveJpeg(bmp, File(dir, "frame%03d.jpg".format(calibCount)))  // クリーンなフレーム
             calibCount++
             Log.i(TAG, "calib saved $calibCount/$CALIB_MAX -> ${dir.absolutePath}")
+            if (calibCount >= CALIB_MAX) {
+                calibMode = false
+                announce("キャリブレーション撮影完了。${CALIB_MAX}枚保存しました")
+            } else if (calibCount % 10 == 0) {
+                announce("${calibCount}枚")
+            }
         }
-        val c = Canvas(bmp)
-        val done = calibCount >= CALIB_MAX
-        c.drawText("CALIB ${min(calibCount, CALIB_MAX)}/$CALIB_MAX${if (done) "  DONE: adb pull" else ""}",
-            16f, 56f, Paint().apply {
-                color = if (done) Color.YELLOW else Color.WHITE; textSize = 48f
-                isAntiAlias = true; setShadowLayer(6f, 0f, 0f, Color.BLACK)
-            })
+        Canvas(bmp).drawText("CALIB ${min(calibCount, CALIB_MAX)}/$CALIB_MAX  (音量±同時で中止)", 16f, 56f,
+            Paint().apply { color = Color.YELLOW; textSize = 48f; isAntiAlias = true; setShadowLayer(6f, 0f, 0f, Color.BLACK) })
     }
 
     /** 上部の状態バー：QR検出数・保存件数・TTS可否・閲覧URL。デモで「どこを見るか」を明示。 */
@@ -609,9 +650,8 @@ class MainActivity : AppCompatActivity() {
         private const val MIN_EXP_NS = 250_000L     // 1/4000s（明るい場面の下限）
         private const val MAX_EXP_NS = 16_000_000L  // 1/62s（ブラー抑制の上限＝暗所でもこれ以上は開けない）
 
-        // 魚眼キャリブ撮影モード：true でビルドすると OCR を行わず解析フレームを連続保存する。
-        // 撮影後に false に戻し、tools/calib で得た値を Calib に焼き込むこと。
-        private const val CALIB_CAPTURE = false
+        // 魚眼キャリブ撮影モード：音量↑＋↓の同時押しで実行時にON（再ビルド不要）。OCRを止め解析フレームを連続保存。
+        // 撮影後 `adb pull` → tools/calib で K,D を推定し Calib に焼き込む。
         private const val CALIB_MAX = 30
         private const val CALIB_INTERVAL_MS = 1200L
 
