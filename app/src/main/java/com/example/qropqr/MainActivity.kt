@@ -41,7 +41,6 @@ import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
-import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.Executors
@@ -246,7 +245,7 @@ class MainActivity : AppCompatActivity() {
         // 検出した全QRを処理：QRごとに向きを判定し、フィールド領域を計算
         val fields = ArrayList<FieldDraw>()
         for (b in barcodes) {
-            val s = b.rawValue?.let { parseSpec(it) } ?: continue
+            val s = parseSpec(b) ?: continue
             val cp = b.cornerPoints ?: continue
             if (cp.size != 4) continue
             val quad = floatArrayOf(
@@ -316,7 +315,7 @@ class MainActivity : AppCompatActivity() {
                 val changed = fieldValues.put(name, text) != text
                 cropView.setImageBitmap(crop)
                 bottomText()?.text = fieldValues.entries.joinToString("\n") { "${it.key}: ${it.value}" }
-                httpServer.publish(name, text, lang, jpegBytes(crop), System.currentTimeMillis())
+                httpServer.publish(name, text, lang, jpegBytes(crop), System.currentTimeMillis(), f.spec.id)
                 if (changed) speak(name, text, lang)
             }
             Log.i(TAG, "RESULT  {\"$name\":\"$text\"}")
@@ -327,23 +326,31 @@ class MainActivity : AppCompatActivity() {
     /** オーバーレイのラベル。OCR済みなら "name: 値"、未OCRなら name。 */
     private fun labelFor(name: String): String = fieldValues[name]?.let { "$name: $it" } ?: name
 
-    private data class Spec(val name: String, val language: String, val x: Float, val y: Float, val w: Float, val h: Float)
+    private data class Spec(val name: String, val language: String, val x: Float, val y: Float, val w: Float, val h: Float, val id: Int = 0)
 
-    private fun parseSpec(raw: String): Spec? {
-        if (raw.startsWith("CQR1,")) {
-            return try {
-                val p = raw.substring(5).split(",")
-                if (p.size < 6) null
-                else Spec(p[0].ifEmpty { "field" }, p[1].ifEmpty { "en" }, p[2].toFloat(), p[3].toFloat(), p[4].toFloat(), p[5].toFloat())
-            } catch (e: Exception) { null }
-        }
+    /**
+     * QRペイロード（CQR2 バイナリ専用）を Spec に解釈。固定10Bヘッダ＋末尾name:
+     *  [0] ver=1 / [1..2] id(uint16 LE) / [3] flags(bit0-1=lang 0:en 1:ja) /
+     *  [4..6] x,y / [7..9] w,h  …各 12bit 符号付き固定小数 Q8.4(=値/16) を2個3バイトにパック /
+     *  [10..] name(UTF-8, 残り全部=可変長, 長さ識別不要)
+     * 12bitパック: (A,B) → [A>>4, (A&0xF)<<4 | B>>8, B&0xFF]。Q8.4=整数8bit+小数4bit, 範囲±128, 分解能1/16。
+     * ML Kit の rawBytes（バイト透過）で読む。未リリースのため CSV/JSON 等の旧形式は非対応。
+     */
+    private fun parseSpec(b: Barcode): Spec? {
+        val rb = b.rawBytes ?: return null
+        if (rb.size < CQR2_HEADER || (rb[0].toInt() and 0xff) != CQR2_VER) return null
         return try {
-            val j = JSONObject(raw)
-            if (!j.has("x") || !j.has("y") || !j.has("w") || !j.has("h")) null
-            else Spec(
-                j.optString("name", j.optString("n", "field")), j.optString("language", j.optString("l", "en")),
-                j.getDouble("x").toFloat(), j.getDouble("y").toFloat(), j.getDouble("w").toFloat(), j.getDouble("h").toFloat()
-            )
+            val id = (rb[1].toInt() and 0xff) or ((rb[2].toInt() and 0xff) shl 8)
+            val lang = if ((rb[3].toInt() and 0x03) == 1) "ja_jp" else "en"
+            fun u(o: Int) = rb[o].toInt() and 0xff
+            fun s12(v: Int): Int = if (v >= 0x800) v - 0x1000 else v   // 12bit符号拡張
+            // [o..o+2] にパックされた2個の12bit値(A,B)を復元（/16でQ8.4実値）
+            val x = s12((u(4) shl 4) or (u(5) shr 4)) / 16f
+            val y = s12(((u(5) and 0x0f) shl 8) or u(6)) / 16f
+            val w = s12((u(7) shl 4) or (u(8) shr 4)) / 16f
+            val h = s12(((u(8) and 0x0f) shl 8) or u(9)) / 16f
+            val name = if (rb.size > CQR2_HEADER) String(rb, CQR2_HEADER, rb.size - CQR2_HEADER, Charsets.UTF_8).trim() else ""
+            Spec(name.ifEmpty { "field" }, lang, x, y, w, h, id)
         } catch (e: Exception) { null }
     }
 
@@ -576,6 +583,8 @@ class MainActivity : AppCompatActivity() {
         private const val OCR_MS = 600L
         private const val SHOW_MS = 80L
         private const val HTTP_PORT = 8080  // 端末内HTTPサーバ。adb forward tcp:8080 tcp:8080 でPCから閲覧可
+        private const val CQR2_VER = 1      // CQR2 バイナリ形式のバージョン（rawBytes[0]＝magic兼用）
+        private const val CQR2_HEADER = 10  // 固定ヘッダ長（ver1+id2+flags1+ xy3B + wh3B；座標は12bit Q8.4パック）
         private const val ORIENT_MS = 250L    // 向き軸を更新する間隔（毎フレームの分類はキャッシュ軸で軽量）
         private const val DBG_ORIENT = false  // 検証用：判定したBR隅をログ出力
         private const val MIN_EXP_NS = 250_000L     // 1/4000s（明るい場面の下限）

@@ -34,7 +34,7 @@ import java.util.concurrent.Executors
  */
 class OcrHttpServer(private val port: Int = 8080) {
 
-    data class Rec(val ts: Long, val name: String, val value: String, val lang: String)
+    data class Rec(val ts: Long, val name: String, val value: String, val lang: String, val id: Int)
 
     private val records = CopyOnWriteArrayList<Rec>()
     private val lastByName = java.util.concurrent.ConcurrentHashMap<String, String>()  // name -> 直近記録値
@@ -61,12 +61,12 @@ class OcrHttpServer(private val port: Int = 8080) {
      * 「そのフィールドの値が前回と変わった時」だけ1行追加（フィールド名ごとに抑制）。
      * 複数フィールドをラウンドロビンOCRしても、同じ値の再読み取りは記録されない。
      */
-    fun publish(name: String, value: String, lang: String, jpeg: ByteArray?, ts: Long) {
+    fun publish(name: String, value: String, lang: String, jpeg: ByteArray?, ts: Long, id: Int = 0) {
         if (jpeg != null) cropJpeg = jpeg
         if (value.isEmpty()) return
-        latest = Rec(ts, name, value, lang)
+        latest = Rec(ts, name, value, lang, id)
         if (lastByName.put(name, value) != value) {
-            records.add(Rec(ts, name, value, lang))
+            records.add(Rec(ts, name, value, lang, id))
             while (records.size > MAX_RECORDS) records.removeAt(0)
         }
     }
@@ -171,7 +171,7 @@ class OcrHttpServer(private val port: Int = 8080) {
     }
 
     private fun recJson(r: Rec) = JSONObject()
-        .put("ts", r.ts).put("name", r.name).put("value", r.value).put("lang", r.lang)
+        .put("ts", r.ts).put("id", r.id).put("name", r.name).put("value", r.value).put("lang", r.lang)
 
     private fun recordsHtml(): String {
         val sb = StringBuilder()

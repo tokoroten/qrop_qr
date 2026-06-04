@@ -23,10 +23,12 @@ THINKLETは **Google Play Services を持たない** AOSP/Fairy OS 端末のた�
 ### 機能
 
 - **QR検出 → 相対座標で領域切り出し → OCR**
-  - QRコードのサイズを1単位とした相対座標 (`x, y, w, h`) でフィールドを定義（[docs/SPEC.md](docs/SPEC.md)）
+  - QRに **CQR2 バイナリ形式**（固定12Bヘッダ＋末尾name）で id・name・lang・相対座標 `x,y,w,h` を埋め込む（[docs/SPEC.md](docs/SPEC.md)）。テキスト形式より小さく低バージョン化でき、低解像度・ブレに強い。ML Kit `getRawBytes()` で復号
+  - QRコードのサイズ（シンボル＝白枠を除く）を1単位とした相対座標でフィールドを定義
   - QRの4隅から `Matrix.setPolyToPoly` で透視変換し、フィールド領域だけを正対画像に切り出してOCR
+  - **マルチQR**：フレーム内の全QRを同時処理（1QR=1フィールド）。OCRは1ティック1フィールドのラウンドロビンで軽量に
   - **回転不変**：ファインダパターンでQRシンボルの上方向を判定し、端末/QRを90°・180°回しても
-    フィールド位置が破綻しない（ML Kit cornerPoints は画像基準のため、軽量なピクセル判定で補正）
+    フィールド位置が破綻しない（ML Kit cornerPoints は画像基準のため、QRごとに軽量なピクセル判定で補正）
 - **オフライン OCR**：ML Kit（バンドル版）Text Recognition v2（Latin + Japanese）
 - **オフライン QR検出**：ML Kit（バンドル版）Barcode Scanning
 - **読み上げ (TTS)**：Fairy Josee（`ai.fd.josee.app.tts`、日英オフライン）。未導入時はTTS無効で動作継続
@@ -84,9 +86,9 @@ adb forward tcp:8080 tcp:8080
 
 [testdata/](testdata/) にサンプルフォーム（QR＋OCR対象テキスト）があります。
 
-- `form_en.png` … `CQR1,name,en,1.2,0,8,1` ＋ "Yamada Taro"
-- `form_ja.png` … `CQR1,user_name,ja_jp,1.2,0,8,1` ＋ "なかやま しんた"
-- `form_multi.png` … **マルチ読み取り（複数QR＝1QR1フィールド）サンプル**。様々な大きさ・オフセット（右/下/左/上, 負値含む）のQR＋読み取り領域を6つ並べたA4縦帳票（`make_multiform.py`）。
+- `form_en.png` … CQR2(`name`,en,x=1.2,w=8,h=1) ＋ "Yamada Taro"
+- `form_ja.png` … CQR2(`user_name`,ja,x=1.2,w=8,h=1) ＋ "なかやま しんた"
+- `form_multi.png` … **マルチ読み取り（複数QR＝1QR1フィールド）サンプル**。様々な大きさ・オフセット（右/下/左/上, 負値含む）のQR＋読み取り領域を6つ並べたA4縦帳票（`make_multiform.py`）。各QRはCQR2バイナリ。
   各フィールドのダミー値: `INV-2026-0042` / `なかやま しんた` / `1600 Amphitheatre Pkwy` / `2026-06-04` / `東京都千代田区一番町` / `A-7F3K-99Z`
 
 `testdata/make_form.py` ／ `testdata/make_multiform.py` で再生成できます（`pip install qrcode pillow`）。

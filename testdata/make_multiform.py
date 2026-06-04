@@ -4,14 +4,18 @@
 1枚の画像に、様々な大きさ・様々なオフセット(右/下/左/上, 負値含む)の
 QR＋読み取り領域を並べ、各領域に適当なダミー文字列を配置する。
 
-各QRは CQR1 形式 `CQR1,<name>,<lang>,<x>,<y>,<w>,<h>` を埋め込む。
-座標はQRサイズ=1単位の相対値で、フィールドのピクセル矩形は
-  left = qr_x + x*S, top = qr_y + y*S, width = w*S, height = h*S   (S=QR一辺px)
-としてアプリの透視変換と一致させる。読み取り対象テキストはこの矩形内に描く。
+各QRは CQR2 バイナリ形式（固定12Bヘッダ＋末尾UTF-8 name）を埋め込む。
+  [0]ver=1 [1:3]id(u16 LE) [3]flags(bit0-1:lang 0=en/1=ja) [4:12]x,y,w,h(int16 Q8.8=値/256) [12:]name
+テキスト形式のCQR1よりバイト数が小さく、QRを低バージョン化＝モジュールが大きく低解像度に強い。
+
+座標はQRシンボル（白枠を除く）=1単位の相対値。フィールドのピクセル矩形は
+  left = symTL_x + x*sym_px, top = symTL_y + y*sym_px, ...（gen_qr参照）としてアプリと一致させる。
 
 依存: pip install qrcode pillow
 """
+import struct
 import qrcode
+from qrcode.util import QRData, MODE_8BIT_BYTE
 from PIL import Image, ImageDraw, ImageFont
 
 JA_FONTS = [
@@ -37,8 +41,21 @@ def find_font(candidates, size):
 BORDER = 4  # クワイエットゾーン(白枠)のモジュール数
 
 
+def cqr2(name, lang, x, y, w, h, id=0):
+    """CQR2 バイナリ payload（固定10Bヘッダ＋末尾UTF-8 name）。
+       座標は 12bit符号付き固定小数 Q8.4(値*16, 範囲±128, 分解能1/16) を2個3バイトにパック。"""
+    flags = 1 if lang.startswith("ja") else 0
+    def q84(v):
+        return max(-2048, min(2047, int(round(v * 16)))) & 0xFFF
+    def pack2(a, b):  # 12bit×2 → 3バイト
+        A, B = q84(a), q84(b)
+        return bytes([(A >> 4) & 0xFF, ((A & 0x0F) << 4) | ((B >> 8) & 0x0F), B & 0xFF])
+    header = struct.pack("<BHB", 1, id & 0xFFFF, flags) + pack2(x, y) + pack2(w, h)
+    return header + name.encode("utf-8")
+
+
 def gen_qr(payload, size_px):
-    """QRを生成し size_px 角に最近傍リサイズ。
+    """QR(payload=bytes)を生成し size_px 角に最近傍リサイズ。
 
     返り値: (img, sym_off, sym_px)
       sym_off … 画像TLから「シンボルTL(=黒モジュール左上)」までのpxオフセット
@@ -47,7 +64,10 @@ def gen_qr(payload, size_px):
     シンボル基準で配置しないと、白枠ぶんだけ原点・スケールがズレる。
     """
     qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_L, box_size=10, border=BORDER)
-    qr.add_data(payload)
+    if isinstance(payload, (bytes, bytearray)):
+        qr.add_data(QRData(bytes(payload), mode=MODE_8BIT_BYTE, check_data=False))  # バイトモード固定
+    else:
+        qr.add_data(payload)
     qr.make(fit=True)
     sym_modules = len(qr.modules)             # シンボルのモジュール数（白枠を除く）
     img_modules = sym_modules + 2 * BORDER    # 画像のモジュール数（白枠を含む）
@@ -71,14 +91,14 @@ def fit_font(text, max_w, max_h, candidates, pad=0.14):
     return font, font.getbbox(text)
 
 
-# (qx, qy, S=QR一辺px, name, lang, x, y, w, h, text)  ※x,y,w,h はQRサイズ単位の相対値
+# (qx, qy, S=QR一辺px, id, name, lang, x, y, w, h, text)  ※x,y,w,h はQRサイズ単位の相対値
 FIELDS = [
-    dict(qx=90,  qy=175,  S=120, name="invoice_no", lang="en",    x=1.3,  y=0.05,  w=6.0, h=0.8, text="INV-2026-0042"),
-    dict(qx=90,  qy=370,  S=150, name="user_name",  lang="ja_jp", x=0.0,  y=1.25,  w=6.5, h=0.9, text="なかやま しんた"),
-    dict(qx=95,  qy=735,  S=205, name="address_en", lang="en",    x=1.2,  y=0.20,  w=4.3, h=1.2, text="1600 Amphitheatre Pkwy"),
-    dict(qx=905, qy=1190, S=130, name="issue_date", lang="en",    x=-5.6, y=-0.95, w=6.0, h=0.7, text="2026-06-04"),
-    dict(qx=985, qy=1335, S=165, name="address_ja", lang="ja_jp", x=-5.4, y=0.10,  w=5.0, h=0.9, text="東京都千代田区一番町"),
-    dict(qx=90,  qy=1565, S=115, name="serial_no",  lang="en",    x=1.4,  y=0.00,  w=5.2, h=0.7, text="A-7F3K-99Z"),
+    dict(qx=90,  qy=175,  S=120, id=1, name="invoice_no", lang="en",    x=1.3,  y=0.05,  w=6.0, h=0.8, text="INV-2026-0042"),
+    dict(qx=90,  qy=370,  S=150, id=2, name="user_name",  lang="ja_jp", x=0.0,  y=1.25,  w=6.5, h=0.9, text="なかやま しんた"),
+    dict(qx=95,  qy=735,  S=205, id=3, name="address_en", lang="en",    x=1.2,  y=0.20,  w=4.3, h=1.2, text="1600 Amphitheatre Pkwy"),
+    dict(qx=905, qy=1190, S=130, id=4, name="issue_date", lang="en",    x=-5.6, y=-0.95, w=6.0, h=0.7, text="2026-06-04"),
+    dict(qx=985, qy=1335, S=165, id=5, name="address_ja", lang="ja_jp", x=-5.4, y=0.10,  w=5.0, h=0.9, text="東京都千代田区一番町"),
+    dict(qx=90,  qy=1565, S=115, id=6, name="serial_no",  lang="en",    x=1.4,  y=0.00,  w=5.2, h=0.7, text="A-7F3K-99Z"),
 ]
 
 W, H = 1240, 1754  # A4 縦 @150dpi 相当
@@ -94,10 +114,11 @@ def main(out_path="form_multi.png"):
     draw.text((90, 116), "複数QR（1QR=1フィールド）／様々な大きさ・オフセットの読み取りサンプル", fill=(90, 90, 90), font=sub)
 
     cap_font = find_font(EN_FONTS, 15)
-    print(f"{'name':<12} {'lang':<6} {'payload':<44} field_px(L,T,W,H)")
+    print(f"{'name':<12} id  {'CQR2':>5} {'(CSV)':>6}  hex")
     for f in FIELDS:
         S = f["S"]
-        payload = f"CQR1,{f['name']},{f['lang']},{f['x']},{f['y']},{f['w']},{f['h']}"
+        payload = cqr2(f["name"], f["lang"], f["x"], f["y"], f["w"], f["h"], f["id"])
+        csv = f"CQR1,{f['name']},{f['lang']},{f['x']},{f['y']},{f['w']},{f['h']}"
         img, sym_off, sym_px = gen_qr(payload, S)
         canvas.paste(img, (f["qx"], f["qy"]))
 
@@ -119,9 +140,9 @@ def main(out_path="form_multi.png"):
         draw.text((tx, ty), f["text"], fill="black", font=font)
 
         # QR直上に小さな注記（QRは読み取り対象ではないので干渉しない）
-        draw.text((f["qx"], f["qy"] - 20), f"{f['name']} [{f['lang']}]", fill=(120, 120, 120), font=cap_font)
+        draw.text((f["qx"], f["qy"] - 20), f"{f['name']} [{f['lang']}] #{f['id']}", fill=(120, 120, 120), font=cap_font)
 
-        print(f"{f['name']:<12} {f['lang']:<6} {payload:<44} ({fx:.0f},{fy:.0f},{fw:.0f},{fh:.0f})")
+        print(f"{f['name']:<12} {f['id']:<3} {len(payload):>4}B {len(csv):>5}B  {payload.hex()}")
 
     canvas.save(out_path)
     print(f"\nwrote {out_path}  ({W}x{H}, {len(FIELDS)} fields)")
