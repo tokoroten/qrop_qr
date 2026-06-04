@@ -90,6 +90,7 @@ class MainActivity : AppCompatActivity() {
 
     // 端末内蔵HTTPサーバ（OCR結果をブラウザでライブ確認＋蓄積閲覧）
     private val httpServer = OcrHttpServer(HTTP_PORT)
+    private var httpUrl = ""   // HUDに表示する閲覧URL（同一LANのIP優先）
 
     private val barcodeScanner = BarcodeScanning.getClient(
         BarcodeScannerOptions.Builder().setBarcodeFormats(Barcode.FORMAT_QR_CODE).build()
@@ -104,6 +105,9 @@ class MainActivity : AppCompatActivity() {
         cropView = findViewById(R.id.crop)
         httpServer.start()
         Log.i(TAG, "HTTP: ${httpServer.urls().joinToString("  /  ")}")
+        // HUD表示用：同一LANのIPがあれば優先、無ければUSB(localhost)案内
+        httpUrl = httpServer.urls().firstOrNull { !it.startsWith("http://localhost") }
+            ?: "http://localhost:$HTTP_PORT (USB: adb forward)"
         tts = TextToSpeech(this, { st ->
             ttsReady = (st == TextToSpeech.SUCCESS)
             Log.i(TAG, "TTS init=$ttsReady engine=${runCatching { tts?.defaultEngine }.getOrNull()}")
@@ -129,6 +133,8 @@ class MainActivity : AppCompatActivity() {
         future.addListener({
             try {
                 val provider = future.get()
+                // 解析解像度。センサは8MP(3264×2448)だが、レンズ/センサの実効解像力が頭打ちで
+                // 8MPは「空の画素」が増えコストだけ上がる（実機検証で確認）。2048×1536 が速度と実効品質の最適点。
                 val rs = ResolutionSelector.Builder().setResolutionStrategy(
                     ResolutionStrategy(Size(1920, 1080), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)
                 ).build()
@@ -271,9 +277,9 @@ class MainActivity : AppCompatActivity() {
                 if (fe != null && f.undField != null) drawOverlayCurved(bmp, f.qrQuad, f.undField, fe, f.fieldQuad, labelFor(f.spec.name))
                 else drawOverlay(bmp, f.qrQuad, f.fieldQuad, labelFor(f.spec.name))
             }
-        } else {
-            drawStatus(bmp, "QRをかざしてください")
         }
+        drawHud(bmp, fields.size)
+        if (fields.isEmpty()) drawHint(bmp, "QR付きフォームをかざしてください")
         drawExpHud(bmp)
         if (now - lastShowMs > SHOW_MS) { lastShowMs = now; showPreview(bmp) }
     }
@@ -530,9 +536,22 @@ class MainActivity : AppCompatActivity() {
             })
     }
 
-    private fun drawStatus(bmp: Bitmap, text: String) {
-        Canvas(bmp).drawText(text, 16f, 56f,
-            Paint().apply { color = Color.WHITE; textSize = 48f; isAntiAlias = true; setShadowLayer(6f, 0f, 0f, Color.BLACK) })
+    /** 上部の状態バー：QR検出数・保存件数・TTS可否・閲覧URL。デモで「どこを見るか」を明示。 */
+    private fun drawHud(bmp: Bitmap, qrCount: Int) {
+        val c = Canvas(bmp)
+        val w = bmp.width.toFloat()
+        c.drawRect(0f, 0f, w, 92f, Paint().apply { color = Color.argb(150, 0, 0, 0) })
+        val (fld, rec) = httpServer.counts()
+        c.drawText("Qrop QR    QR:$qrCount    保存 ${fld}項目/${rec}件    ${if (ttsReady) "TTS:on" else "TTS:off"}",
+            16f, 40f, Paint().apply { color = Color.WHITE; textSize = 34f; isAntiAlias = true; setShadowLayer(4f, 0f, 0f, Color.BLACK) })
+        c.drawText(httpUrl, 16f, 80f,
+            Paint().apply { color = Color.CYAN; textSize = 30f; isAntiAlias = true; setShadowLayer(4f, 0f, 0f, Color.BLACK) })
+    }
+
+    /** 画面中央のガイダンス（QR未検出時）。 */
+    private fun drawHint(bmp: Bitmap, text: String) {
+        val p = Paint().apply { color = Color.WHITE; textSize = 50f; isAntiAlias = true; setShadowLayer(6f, 0f, 0f, Color.BLACK) }
+        Canvas(bmp).drawText(text, (bmp.width - p.measureText(text)) / 2f, bmp.height * 0.55f, p)
     }
 
     private fun showPreview(bmp: Bitmap) {

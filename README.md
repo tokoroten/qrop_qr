@@ -23,7 +23,7 @@ THINKLETは **Google Play Services を持たない** AOSP/Fairy OS 端末のた�
 ### 機能
 
 - **QR検出 → 相対座標で領域切り出し → OCR**
-  - QRに **CQR2 バイナリ形式**（固定12Bヘッダ＋末尾name）で id・name・lang・相対座標 `x,y,w,h` を埋め込む（[docs/SPEC.md](docs/SPEC.md)）。テキスト形式より小さく低バージョン化でき、低解像度・ブレに強い。ML Kit `getRawBytes()` で復号
+  - QRに **CQR2 バイナリ形式**（固定10Bヘッダ＋末尾name、座標は12bit固定小数Q8.4）で id・name・lang・相対座標 `x,y,w,h` を埋め込む（[docs/SPEC.md](docs/SPEC.md)）。テキスト形式より小さく低バージョン化でき、低解像度・ブレに強い。ML Kit `getRawBytes()` で復号
   - QRコードのサイズ（シンボル＝白枠を除く）を1単位とした相対座標でフィールドを定義
   - QRの4隅から `Matrix.setPolyToPoly` で透視変換し、フィールド領域だけを正対画像に切り出してOCR
   - **マルチQR**：フレーム内の全QRを同時処理（1QR=1フィールド）。OCRは1ティック1フィールドのラウンドロビンで軽量に
@@ -36,6 +36,7 @@ THINKLETは **Google Play Services を持たない** AOSP/Fairy OS 端末のた�
 - **モーションブラー対策**：Camera2 manual sensor によるアダプティブ高速シャッター
   - 露光時間の上限を **1/62s (`MAX_EXP_NS`)** に固定し、明るさを測りながらブラーを抑えつつ露出を自動調整（QRはブラーに弱いため）
 - **3分割UI**：上＝カメラLive＋認識枠（QR=緑 / フィールド=シアン）、中＝切り出した透視変換画像、下＝OCR結果文字列
+  - 上部に状態バー（**QR検出数・保存件数・TTS可否・閲覧URL**）を表示し、デモで「どこを見るか」が一目で分かる
 
 ### 動作環境 / ビルド
 
@@ -49,6 +50,14 @@ THINKLETは **Google Play Services を持たない** AOSP/Fairy OS 端末のた�
 adb install -r -g app/build/outputs/apk/debug/app-debug.apk
 ```
 
+### デモの流れ
+
+1. `testdata/form_multi.png` を画面表示（または印刷）。`make_multiform.py` で再生成可。
+2. アプリを起動し、THINKLET を書類に向ける。上部の状態バーに `QR:N` と**閲覧URL**が表示される。
+3. PC/タブレットのブラウザで、状態バーのURL（同一WiFi）か、`adb forward tcp:8080 tcp:8080` 経由の `http://localhost:8080` を開く。
+4. 各フィールドが切り出し→OCRされ、「**現在値**」に1行ずつ並び、変化が「**履歴**」に蓄積される（**CSV**で取り出し可）。
+5. 日本語フィールドは Josee 導入時に読み上げ（任意）。
+
 ### TTS（Josee）について
 
 THINKLET内蔵の Pico TTS (`com.svox.pico`) は `synthesizeText` でネイティブクラッシュするため使えません。
@@ -61,23 +70,29 @@ adb shell settings put secure tts_default_synth ai.fd.josee.app.tts
 
 ### 端末内HTTPビューア
 
-THINKLETには見やすい画面が無いため、OCR結果を外部ブラウザで確認できる軽量HTTPサーバを内蔵しています（ポート `8080`、依存ライブラリなし＝GMS非依存を維持）。読み取るたびに値が1行ずつ蓄積され、「貯まっていく」様子をそのまま見せられます。
+THINKLETには見やすい画面が無いため、OCR結果を外部ブラウザで確認できる軽量HTTPサーバを内蔵しています（ポート `8080`、依存ライブラリなし＝GMS非依存を維持）。画面は **ライブ / 現在値 / 履歴** の3カードで自動更新（~700ms）。
+
+- **ライブ**：最新の切り出し画像＋認識値
+- **現在値**：1フィールド1行（OCRが多少ブレても表示は安定）
+- **履歴**：値が変わるたび1行追加。**CSVダウンロード**・**クリア**ボタン付き
 
 ```bash
 # USB接続のみで見る（同一LAN不要）
 adb forward tcp:8080 tcp:8080
 # → ブラウザで http://localhost:8080
 
-# 同一WiFiのPC/タブレットから見る場合は端末IP（起動ログ "HTTP listening on :8080 -> ..." を参照）
+# 同一WiFiのPC/タブレットから見る場合は端末IP（端末の状態バー、または起動ログ "HTTP listening on :8080 -> ..." を参照）
 # → http://<端末IP>:8080
 ```
 
 | エンドポイント | 内容 |
 | --- | --- |
-| `GET /` | ライブ確認（最新の切り出し画像＋認識値）＋蓄積テーブル（~700msで自動更新） |
-| `GET /records` | 蓄積テーブルのスナップショット（サーバ描画・印刷向け） |
-| `GET /records.json` | 機械可読JSON（将来のDB連携／外部POSTへの橋渡し） |
-| `GET /state.json` | ライブ画面用（最新値＋全レコード） |
+| `GET /` | ビューア（ライブ＋現在値＋履歴、自動更新、CSV/クリア） |
+| `GET /state.json` | ビュー用JSON（最新値＋現在値＋履歴） |
+| `GET /records.json` | 履歴の機械可読JSON（将来のDB連携／外部POSTへの橋渡し） |
+| `GET /records.csv` | 履歴のCSVダウンロード |
+| `GET /records` | 履歴のスナップショット（サーバ描画・印刷向け） |
+| `GET /clear` | 記録を全消去 |
 | `GET /crop.jpg` | 最新の切り出し画像（JPEG） |
 
 > 注: 本サーバは**デモ・検証用**の「端末＝サーバ」構成です。本番のConnected Worker構成では「端末＝クライアント→収集サーバ→DB」と逆向きになります。`/records.json` を用意してあるので、その移行（外部エンドポイントへのPOST）は容易です。
@@ -92,6 +107,12 @@ adb forward tcp:8080 tcp:8080
   各フィールドのダミー値: `INV-2026-0042` / `なかやま しんた` / `1600 Amphitheatre Pkwy` / `2026-06-04` / `東京都千代田区一番町` / `A-7F3K-99Z`
 
 `testdata/make_form.py` ／ `testdata/make_multiform.py` で再生成できます（`pip install qrcode pillow`）。
+
+## ライセンス
+
+[MIT License](LICENSE)。
+
+依存ライブラリ（ML Kit / CameraX / AndroidX 等）は各々のライセンスに従います。TTSの **Josee** は本リポジトリに含みません（別途ビルド・導入。前述）。
 
 ## 特許
 - 本実装は、富士通が保有していた特許第４３９８４７４号に酷似しています
