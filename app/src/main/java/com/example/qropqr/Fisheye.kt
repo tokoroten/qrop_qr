@@ -63,22 +63,44 @@ class Fisheye(
  * k1..k4 は無次元（角度の関数）なので解像度に依らず一定。fx,fy,cx,cy のみ実行時解像度へ線形スケール。
  */
 object Calib {
-    const val enabled = true              // false にすると歪み補正を無効化（従来の純ホモグラフィ）
-    private const val refW = 2048.0       // 推定時の解析解像度
-    private const val refH = 1536.0
-    private const val fx = 1080.6801066313897
-    private const val fy = 1078.1127565569914
-    private const val cx = 994.9940846792864
-    private const val cy = 736.4125872987854
-    private const val k1 = 0.35308315001651824
-    private const val k2 = -0.26880705937503846
-    private const val k3 = 0.1276706402798861
-    private const val k4 = 0.023033044219524554
+    var enabled = true              // false にすると歪み補正を無効化（従来の純ホモグラフィ）
+    // 既定値は実機キャリブ結果（焼き込み）。端末内キャリブ or 永続化ファイルがあれば上書きされる。
+    var refW = 2048.0               // 推定時の解析解像度
+    var refH = 1536.0
+    var fx = 1080.6801066313897
+    var fy = 1078.1127565569914
+    var cx = 994.9940846792864
+    var cy = 736.4125872987854
+    var k1 = 0.35308315001651824
+    var k2 = -0.26880705937503846
+    var k3 = 0.1276706402798861
+    var k4 = 0.023033044219524554
 
     /** 実行時フレーム解像度に合わせた Fisheye を返す。 */
     fun forSize(w: Int, h: Int): Fisheye {
         val sx = w / refW
         val sy = h / refH
         return Fisheye(fx * sx, fy * sy, cx * sx, cy * sy, k1, k2, k3, k4)
+    }
+
+    /** 端末内キャリブ結果で更新（refW/refH=撮影時の解析解像度）。 */
+    fun update(fx: Double, fy: Double, cx: Double, cy: Double,
+               k1: Double, k2: Double, k3: Double, k4: Double, refW: Double, refH: Double) {
+        this.fx = fx; this.fy = fy; this.cx = cx; this.cy = cy
+        this.k1 = k1; this.k2 = k2; this.k3 = k3; this.k4 = k4
+        this.refW = refW; this.refH = refH; this.enabled = true
+    }
+
+    fun toJson(): String = org.json.JSONObject().apply {
+        put("refW", refW); put("refH", refH); put("fx", fx); put("fy", fy); put("cx", cx); put("cy", cy)
+        put("k1", k1); put("k2", k2); put("k3", k3); put("k4", k4)
+    }.toString()
+
+    fun fromJson(s: String) {
+        val j = org.json.JSONObject(s)
+        refW = j.getDouble("refW"); refH = j.getDouble("refH")
+        fx = j.getDouble("fx"); fy = j.getDouble("fy"); cx = j.getDouble("cx"); cy = j.getDouble("cy")
+        k1 = j.getDouble("k1"); k2 = j.getDouble("k2"); k3 = j.getDouble("k3"); k4 = j.getDouble("k4")
+        enabled = true
     }
 }

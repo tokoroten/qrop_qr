@@ -18,7 +18,7 @@ Qrop QRは、**QRコードに含まれた情報からOCRすべき相対座標を
 
 本リポジトリは、Fairy Devices社のウェアラブル端末 **THINKLET (LC01)** 向けの **Kotlin / Android ネイティブ実装** です。
 
-THINKLETは **Google Play Services を持たない** AOSP/Fairy OS 端末のため、QR検出・OCR・TTSはすべて **端末内（オフライン）** で完結させています。
+THINKLETは **Google Play Services を持たない** AOSP/Fairy OS 端末のため、QR検出・OCR・TTS・魚眼キャリブはすべて **端末内（オフライン）** で完結させています。
 
 ### 機能
 
@@ -31,19 +31,21 @@ THINKLETは **Google Play Services を持たない** AOSP/Fairy OS 端末のた�
     フィールド位置が破綻しない（ML Kit cornerPoints は画像基準のため、QRごとに軽量なピクセル判定で補正）
 - **オフライン OCR**：ML Kit（バンドル版）Text Recognition v2（Latin + Japanese）
 - **オフライン QR検出**：ML Kit（バンドル版）Barcode Scanning
-- **読み上げ (TTS)**：Fairy Josee（`ai.fd.josee.app.tts`、日英オフライン）。未導入時はTTS無効で動作継続
+- **読み上げ (TTS)**：Fairy Josee（`ai.fd.josee.app.tts`、日英オフライン）で**認識値を読み上げ**（カラム名は読まない＝日本語TTSが英字を1字ずつ読むのを回避。同じ値の連呼も抑制）。未導入時はTTS無効で動作継続
 - **端末内HTTPビューア**：OCR結果をブラウザでライブ確認＋蓄積閲覧（依存ライブラリなしの内蔵HTTPサーバ。後述）
 - **モーションブラー対策**：Camera2 manual sensor によるアダプティブ高速シャッター
   - 露光時間の上限を **1/62s (`MAX_EXP_NS`)** に固定し、明るさを測りながらブラーを抑えつつ露出を自動調整（QRはブラーに弱いため）
 - **3分割UI**：上＝カメラLive＋認識枠（QR=緑 / フィールド=シアン）、中＝切り出した透視変換画像、下＝OCR結果文字列
   - 上部に状態バー（**QR検出数・保存件数・TTS可否・閲覧URL**）を表示し、デモで「どこを見るか」が一目で分かる
-- **物理ボタン操作**：タッチの無いTHINKLET向けに、**音量↑＋音量↓の同時押し**で魚眼キャリブ撮影モードへ（再ビルド不要、TTSで進捗案内・30枚で自動終了）。詳細は [tools/calib/](tools/calib/)
+- **端末内 魚眼キャリブ**：タッチの無いTHINKLET向けに、**音量↑＋音量↓の同時押し**でキャリブモードへ（再ビルド不要）。チェスボードを複数視点で見せると、**端末内で OpenCV `fisheye.calibrate` を実行**して K,D を推定し `filesDir/calib.json` に永続化（再起動後も自動ロード）。PC不要。詳細は [tools/calib/](tools/calib/)
 
 ### 動作環境 / ビルド
 
 - 端末: THINKLET LC01（Android 8.1 / API 27, arm64-v8a, GMSなし, 広角カメラ）
 - ツールチェイン: AGP 8.10 / Kotlin 2.1 / compileSdk 36 / minSdk 27 / Gradle 8.13 / JDK 21 (JBR)
 - ABI: `arm64-v8a` のみ
+- 主要依存: ML Kit（バンドル版, GMS非依存）/ CameraX / **OpenCV**（端末内キャリブ用, `org.opencv:opencv`）。OpenCVのネイティブ.soで APK は約56MB（arm64）
+- 解析解像度: 2048×1536（4:3）。センサは8MPだがレンズ実効解像力が頭打ちのため、速度と実効品質の最適点として採用
 
 ```bash
 # ビルド & インストール（adb が通る状態で）

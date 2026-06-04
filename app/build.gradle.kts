@@ -42,4 +42,7 @@ dependencies {
     implementation("com.google.mlkit:barcode-scanning:17.3.0")
     implementation("com.google.mlkit:text-recognition:16.0.1")            // Latin
     implementation("com.google.mlkit:text-recognition-japanese:16.0.1")   // 日本語
+
+    // OpenCV（端末内 魚眼キャリブ：findChessboardCornersSB + fisheye.calibrate）。GMS非依存のネイティブCV。
+    implementation("org.opencv:opencv:4.11.0")
 }

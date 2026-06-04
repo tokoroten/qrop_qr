@@ -42,6 +42,17 @@ import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import org.opencv.android.OpenCVLoader
+import org.opencv.android.Utils
+import org.opencv.calib3d.Calib3d
+import org.opencv.core.CvType
+import org.opencv.core.Mat
+import org.opencv.core.MatOfPoint2f
+import org.opencv.core.MatOfPoint3f
+import org.opencv.core.Point3
+import org.opencv.core.Size as CvSize
+import org.opencv.core.TermCriteria
+import org.opencv.imgproc.Imgproc
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.Executors
@@ -77,10 +88,18 @@ class MainActivity : AppCompatActivity() {
     private var expHi = 16_000_000L
     private var lastExpMs = 0L
 
-    // 魚眼キャリブ撮影モード（音量↑＋↓の同時押しで実行時にON/OFF）
+    // 魚眼キャリブ（音量↑＋↓の同時押しで実行時にON/OFF）。チェスボードを複数視点で見せ、端末内で推定。
     @Volatile private var calibMode = false
-    private var calibCount = 0
+    private var opencvReady = false
     private var lastCalibMs = 0L
+    private var calViews = 0
+    private val calObjPoints = ArrayList<Mat>()   // 各視点のボード3D点（z=0）
+    private val calImgPoints = ArrayList<Mat>()   // 各視点の検出コーナー
+    private val objp: MatOfPoint3f by lazy {
+        val pts = ArrayList<Point3>()
+        for (i in 0 until 6) for (j in 0 until 9) pts.add(Point3(j.toDouble(), i.toDouble(), 0.0))  // 9x6内側コーナー
+        MatOfPoint3f(*pts.toTypedArray())
+    }
     private val keysDown = HashSet<Int>()   // 物理キーの同時押し判定用
     private var chordFired = false          // chord発火済みフラグ（キーリピートの再発火抑制）
 
@@ -112,6 +131,10 @@ class MainActivity : AppCompatActivity() {
         // HUD表示用：同一LANのIPがあれば優先、無ければUSB(localhost)案内
         httpUrl = httpServer.urls().firstOrNull { !it.startsWith("http://localhost") }
             ?: "http://localhost:$HTTP_PORT (USB: adb forward)"
+        // OpenCV（端末内キャリブ用）初期化＋永続化キャリブのロード（あれば焼き込み既定値を上書き）
+        opencvReady = OpenCVLoader.initLocal()
+        Log.i(TAG, "OpenCV init=$opencvReady")
+        loadCalib()
         tts = TextToSpeech(this, { st ->
             ttsReady = (st == TextToSpeech.SUCCESS)
             Log.i(TAG, "TTS init=$ttsReady engine=${runCatching { tts?.defaultEngine }.getOrNull()}")
@@ -148,12 +171,14 @@ class MainActivity : AppCompatActivity() {
         return super.onKeyUp(keyCode, event)
     }
 
-    /** キャリブ撮影モードのトグル。入る時はカウンタをリセットしTTSで案内。 */
+    /** キャリブモードのトグル。入る時は蓄積をリセットしTTSで案内。 */
     private fun toggleCalibMode() {
+        if (!calibMode && !opencvReady) { announce("OpenCV初期化に失敗。キャリブできません"); return }
         calibMode = !calibMode
         if (calibMode) {
-            calibCount = 0; lastCalibMs = 0L
-            announce("キャリブレーションモードを開始します。チェスボードを傾けて見せてください")
+            calImgPoints.forEach { it.release() }; calImgPoints.clear(); calObjPoints.clear()
+            calViews = 0; lastCalibMs = 0L
+            announce("キャリブレーションモードを開始します。チェスボードを色々な角度で見せてください")
         } else {
             announce("キャリブレーションを中止しました")
         }
@@ -558,24 +583,57 @@ class MainActivity : AppCompatActivity() {
             Paint().apply { color = Color.YELLOW; textSize = 54f; isAntiAlias = true; setShadowLayer(6f, 0f, 0f, Color.BLACK) })
     }
 
-    /** キャリブ撮影：解析フレーム(オーバーレイ前)を一定間隔で external files/calib に保存。N枚で自動終了。 */
+    /** 端末内キャリブ：チェスボード(9x6)のコーナーを一定間隔で検出・蓄積し、規定視点数で fisheye.calibrate を実行。 */
     private fun runCalibCapture(bmp: Bitmap, now: Long) {
-        if (now - lastCalibMs > CALIB_INTERVAL_MS) {
+        if (calViews < CAL_VIEWS && now - lastCalibMs > CALIB_INTERVAL_MS) {
             lastCalibMs = now
-            val dir = File(getExternalFilesDir(null), "calib").apply { mkdirs() }
-            saveJpeg(bmp, File(dir, "frame%03d.jpg".format(calibCount)))  // クリーンなフレーム
-            calibCount++
-            Log.i(TAG, "calib saved $calibCount/$CALIB_MAX -> ${dir.absolutePath}")
-            if (calibCount >= CALIB_MAX) {
-                calibMode = false
-                announce("キャリブレーション撮影完了。${CALIB_MAX}枚保存しました")
-            } else if (calibCount % 10 == 0) {
-                announce("${calibCount}枚")
-            }
+            val rgba = Mat(); val gray = Mat(); val corners = MatOfPoint2f()
+            try {
+                Utils.bitmapToMat(bmp, rgba)
+                Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
+                if (Calib3d.findChessboardCornersSB(gray, CvSize(9.0, 6.0), corners)) {
+                    calObjPoints.add(objp); calImgPoints.add(corners)   // corners は蓄積するので release しない
+                    calViews++
+                    announce("視点 $calViews")
+                    Log.i(TAG, "calib view $calViews/$CAL_VIEWS")
+                } else {
+                    corners.release()
+                }
+            } catch (e: Exception) { Log.w(TAG, "corner detect failed", e); corners.release() }
+            finally { rgba.release(); gray.release() }
+            if (calViews >= CAL_VIEWS) finishCalibration(bmp.width, bmp.height)
         }
-        Canvas(bmp).drawText("CALIB ${min(calibCount, CALIB_MAX)}/$CALIB_MAX  (音量±同時で中止)", 16f, 56f,
+        Canvas(bmp).drawText("CALIB 視点 ${min(calViews, CAL_VIEWS)}/$CAL_VIEWS  (音量±同時で中止)", 16f, 56f,
             Paint().apply { color = Color.YELLOW; textSize = 48f; isAntiAlias = true; setShadowLayer(6f, 0f, 0f, Color.BLACK) })
     }
+
+    /** 蓄積した視点で OpenCV の魚眼キャリブを実行→Calib更新＋永続化。完了/失敗をTTS通知して通常モードへ戻る。 */
+    private fun finishCalibration(w: Int, h: Int) {
+        val K = Mat.zeros(3, 3, CvType.CV_64F)
+        val D = Mat.zeros(4, 1, CvType.CV_64F)
+        val rvecs = ArrayList<Mat>(); val tvecs = ArrayList<Mat>()
+        try {
+            val flags = Calib3d.fisheye_CALIB_RECOMPUTE_EXTRINSIC or Calib3d.fisheye_CALIB_FIX_SKEW
+            val crit = TermCriteria(TermCriteria.EPS + TermCriteria.MAX_ITER, 100, 1e-6)
+            val rms = Calib3d.fisheye_calibrate(calObjPoints, calImgPoints, CvSize(w.toDouble(), h.toDouble()), K, D, rvecs, tvecs, flags, crit)
+            Calib.update(K.get(0, 0)[0], K.get(1, 1)[0], K.get(0, 2)[0], K.get(1, 2)[0],
+                D.get(0, 0)[0], D.get(1, 0)[0], D.get(2, 0)[0], D.get(3, 0)[0], w.toDouble(), h.toDouble())
+            saveCalib()
+            Log.i(TAG, "fisheye calib OK rms=$rms K=(${Calib.fx},${Calib.fy},${Calib.cx},${Calib.cy}) D=(${Calib.k1},${Calib.k2},${Calib.k3},${Calib.k4})")
+            announce("キャリブレーション完了。誤差%.1fピクセル".format(rms))
+        } catch (e: Exception) {
+            Log.e(TAG, "fisheye calibrate failed", e)
+            announce("キャリブレーション失敗。明るい所で撮り直してください")
+        } finally {
+            K.release(); D.release(); rvecs.forEach { it.release() }; tvecs.forEach { it.release() }
+            calImgPoints.forEach { it.release() }; calImgPoints.clear(); calObjPoints.clear()
+            calViews = 0; calibMode = false
+        }
+    }
+
+    private fun calibFile() = File(filesDir, "calib.json")
+    private fun saveCalib() { runCatching { calibFile().writeText(Calib.toJson()) } }
+    private fun loadCalib() { runCatching { if (calibFile().exists()) { Calib.fromJson(calibFile().readText()); Log.i(TAG, "loaded calib.json") } } }
 
     /** 上部の状態バー：QR検出数・保存件数・TTS可否・閲覧URL。デモで「どこを見るか」を明示。 */
     private fun drawHud(bmp: Bitmap, qrCount: Int) {
@@ -650,9 +708,9 @@ class MainActivity : AppCompatActivity() {
         private const val MIN_EXP_NS = 250_000L     // 1/4000s（明るい場面の下限）
         private const val MAX_EXP_NS = 16_000_000L  // 1/62s（ブラー抑制の上限＝暗所でもこれ以上は開けない）
 
-        // 魚眼キャリブ撮影モード：音量↑＋↓の同時押しで実行時にON（再ビルド不要）。OCRを止め解析フレームを連続保存。
-        // 撮影後 `adb pull` → tools/calib で K,D を推定し Calib に焼き込む。
-        private const val CALIB_MAX = 30
+        // 魚眼キャリブ：音量↑＋↓の同時押しで実行時にON（再ビルド不要）。チェスボードを複数視点で見せ、
+        // 端末内でコーナー検出＋fisheye.calibrateを実行→結果を filesDir/calib.json に永続化。
+        private const val CAL_VIEWS = 15           // キャリブに使う視点数（各成功検出で+1）
         private const val CALIB_INTERVAL_MS = 1200L
 
         // QRサイズの単位正方形（TL,TR,BR,BL）。ML Kit cornerPoints の並びに一致。
