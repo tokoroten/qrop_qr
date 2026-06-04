@@ -18,6 +18,7 @@ import android.util.Log
 import java.util.Locale
 import android.util.Size
 import android.view.KeyEvent
+import android.view.WindowManager
 import android.widget.ImageView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
@@ -123,6 +124,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 画面の無いウェアラブル運用のためスリープ防止（THINKLET開発ガイドライン）
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContentView(R.layout.activity_main)
         previewView = findViewById(R.id.preview)
         cropView = findViewById(R.id.crop)
