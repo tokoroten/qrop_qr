@@ -39,6 +39,12 @@ THINKLETは **Google Play Services を持たない** AOSP/Fairy OS 端末のた�
   - 上部に状態バー（**QR検出数・保存件数・TTS可否・閲覧URL**）を表示し、デモで「どこを見るか」が一目で分かる
 - **端末内 魚眼キャリブ**：タッチの無いTHINKLET向けに、**音量↑＋音量↓の同時押し**でキャリブモードへ（再ビルド不要）。チェスボードを複数視点で見せると、**端末内で OpenCV `fisheye.calibrate` を実行**して K,D を推定し `filesDir/calib.json` に永続化（再起動後も自動ロード）。PC不要。詳細は [tools/calib/](tools/calib/)
 
+### 動作画面
+
+![Qrop QR 実機動作：上＝QR/フィールド枠付きカメラLive、中＝透視変換で切り出したフィールド、下＝多言語OCR結果（issue_date / address_en / address_ja / serial_no）](docs/screenshot.png)
+
+実機（THINKLET LC01）で書類を見たときの3分割UI。QRから読み取った相対座標でフィールドを切り出し、日英OCRした結果が下部に並ぶ。
+
 ### 動作環境 / ビルド
 
 - 端末: THINKLET LC01（Android 8.1 / API 27, arm64-v8a, GMSなし, 広角カメラ）
