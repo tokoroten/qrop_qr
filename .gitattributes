@@ -1,0 +1,4 @@
+# Gradle wrapper: 改行コードを固定（.bat は CRLF でないと cmd が誤動作し得る）
+gradlew text eol=lf
+*.bat text eol=crlf
+*.jar binary

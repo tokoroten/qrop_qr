@@ -5,45 +5,78 @@
     android:orientation="vertical"
     android:background="#111111">
 
-    <!-- ① 上: カメラLIVE ＋ 認識領域オーバーレイ（横画像をfitCenterで全体表示） -->
+    <!-- 状態バー：QR検出数・保存件数・TTS可否／閲覧URL（ネイティブ文字で小画面でも読める） -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:background="#1B1B1B"
+        android:paddingHorizontal="10dp"
+        android:paddingVertical="5dp">
+
+        <TextView
+            android:id="@+id/status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textColor="#EEEEEE"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:singleLine="true"
+            android:text="Qrop QR" />
+
+        <TextView
+            android:id="@+id/url"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textColor="#4DD0E1"
+            android:textSize="12sp"
+            android:maxLines="2"
+            android:ellipsize="end" />
+    </LinearLayout>
+
+    <!-- ① カメラLIVE ＋ 認識領域オーバーレイ。高さはコードで幅×3/4（4:3）に合わせ、黒帯を出さない -->
     <ImageView
         android:id="@+id/preview"
         android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1"
+        android:layout_height="270dp"
         android:scaleType="fitCenter"
         android:background="#000000"
         android:contentDescription="preview" />
 
-    <!-- 区切りラベル -->
+    <!-- ② 切り出し画像（直近にOCRしたフィールド） -->
     <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:background="#222222"
-        android:textColor="#AAAAAA"
-        android:paddingHorizontal="10dp"
-        android:paddingVertical="4dp"
-        android:textSize="12sp"
+        android:id="@+id/cropLabel"
+        style="@style/SectionHeader"
         android:text="切り出し（透視変換）" />
 
-    <!-- ② 中: 認識領域を透視変換で切り出した画像 -->
     <ImageView
         android:id="@+id/crop"
         android:layout_width="match_parent"
-        android:layout_height="140dp"
+        android:layout_height="56dp"
+        android:padding="4dp"
         android:scaleType="fitCenter"
         android:background="#000000"
         android:contentDescription="crop" />
 
-    <!-- ③ 下: 認識した文字列 -->
+    <!-- ③ 認識結果（フィールドごとに1行）。行数に応じて文字サイズを自動縮小し、全項目を画面内に収める -->
+    <TextView
+        style="@style/SectionHeader"
+        android:text="認識結果" />
+
     <TextView
         android:id="@+id/text"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
+        android:layout_height="0dp"
+        android:layout_weight="1"
         android:background="#000000"
-        android:textColor="#FFFFFF"
-        android:padding="12dp"
-        android:textSize="22sp"
-        android:text="Qrop QR — QRをかざしてください" />
+        android:paddingHorizontal="12dp"
+        android:paddingVertical="6dp"
+        android:gravity="top"
+        android:autoSizeTextType="uniform"
+        android:autoSizeMinTextSize="10sp"
+        android:autoSizeMaxTextSize="17sp"
+        android:autoSizeStepGranularity="1sp"
+        android:textColor="#888888"
+        android:text="QR付きの帳票をカメラに向けてください" />
 
 </LinearLayout>

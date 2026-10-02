@@ -1,6 +1,7 @@
 package com.example.qropqr
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
@@ -11,9 +12,15 @@ import android.graphics.Path
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
+import android.net.ConnectivityManager
+import android.net.Network
 import android.os.Bundle
 import android.os.SystemClock
+import android.provider.Settings
 import android.speech.tts.TextToSpeech
+import android.text.SpannableStringBuilder
+import android.text.Spanned
+import android.text.style.ForegroundColorSpan
 import android.util.Log
 import java.util.Locale
 import android.util.Size
@@ -30,11 +37,13 @@ import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import com.example.qropqr.mdns.MdnsAdvertiser
 import com.google.android.gms.tasks.Tasks
 import com.google.mlkit.vision.barcode.BarcodeScannerOptions
 import com.google.mlkit.vision.barcode.BarcodeScanning
@@ -68,7 +77,7 @@ import kotlin.math.roundToInt
  * モーションブラー対策に Camera2 manual sensor で高速シャッター＋高ゲインを適用。
  * UI: 上=LIVE+認識枠 / 中=切出し画像 / 下=認識文字列。ML Kitは端末内バンドル(GMS非依存)。
  */
-@OptIn(ExperimentalCamera2Interop::class)
+@androidx.annotation.OptIn(markerClass = [ExperimentalCamera2Interop::class])
 class MainActivity : AppCompatActivity() {
 
     private val camExec = Executors.newSingleThreadExecutor()
@@ -78,6 +87,8 @@ class MainActivity : AppCompatActivity() {
 
     // マルチQR用の状態（フィールド名で管理）
     private val fieldValues = java.util.concurrent.ConcurrentHashMap<String, String>()  // name -> 最新OCR値
+    private val fieldIds = java.util.concurrent.ConcurrentHashMap<String, Int>()         // name -> QRのid（結果一覧の並び順）
+    @Volatile private var qrCount = 0                                                    // 直近フレームのQR検出数（状態バー用）
     private val orientCache = HashMap<String, Pair<Int, Long>>()                         // name -> (brK, ts) QRごとの向き
     private val lastOcrByName = HashMap<String, Long>()                                  // name -> 最終OCR時刻（公平なRR）
 
@@ -106,6 +117,9 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var previewView: ImageView
     private lateinit var cropView: ImageView
+    private lateinit var cropLabel: TextView
+    private lateinit var statusView: TextView
+    private lateinit var urlView: TextView
 
     // 読み上げ(TTS)
     private var tts: TextToSpeech? = null
@@ -114,7 +128,31 @@ class MainActivity : AppCompatActivity() {
 
     // 端末内蔵HTTPサーバ（OCR結果をブラウザでライブ確認＋蓄積閲覧）
     private val httpServer = OcrHttpServer(HTTP_PORT)
-    private var httpUrl = ""   // HUDに表示する閲覧URL（同一LANのIP優先）
+    @Volatile private var httpUrl = ""   // HUDに表示する閲覧URL（mDNS名＋同一LANのIP）
+
+    // mDNS：同一LANから http://<名前>.local:8080 で閲覧できるよう広告（thinklet-gesture-cam から流用）。
+    // 複数台で衝突しないよう、ホスト名は端末固有の ANDROID_ID から決める（例 qropqr-1a2b）。
+    private val mdnsHost by lazy {
+        val id = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID).orEmpty()
+        if (id.length >= 4) "qropqr-${id.takeLast(4).lowercase()}" else "qropqr"
+    }
+    private val mdns by lazy {
+        MdnsAdvertiser(
+            applicationContext,
+            port = HTTP_PORT,
+            hostLabel = { mdnsHost },
+            serviceName = { "Qrop QR" },
+            txt = mapOf("path" to "/"),
+            logTag = TAG,
+            holdWifiLock = true,
+            onRegistered = { updateHttpUrl() },
+        )
+    }
+    private val connManager by lazy { getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager }
+    private val netCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) { mdns.reregister(); updateHttpUrl() }
+        override fun onLost(network: Network) { updateHttpUrl() }
+    }
 
     private val barcodeScanner = BarcodeScanning.getClient(
         BarcodeScannerOptions.Builder().setBarcodeFormats(Barcode.FORMAT_QR_CODE).build()
@@ -129,11 +167,18 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
         previewView = findViewById(R.id.preview)
         cropView = findViewById(R.id.crop)
+        cropLabel = findViewById(R.id.cropLabel)
+        statusView = findViewById(R.id.status)
+        urlView = findViewById(R.id.url)
+        // Live表示の高さを解析画像と同じ4:3に合わせる（weightで伸ばすと上下に黒帯が出る）
+        previewView.post {
+            previewView.layoutParams = previewView.layoutParams.apply { height = previewView.width * 3 / 4 }
+        }
         httpServer.start()
         Log.i(TAG, "HTTP: ${httpServer.urls().joinToString("  /  ")}")
-        // HUD表示用：同一LANのIPがあれば優先、無ければUSB(localhost)案内
-        httpUrl = httpServer.urls().firstOrNull { !it.startsWith("http://localhost") }
-            ?: "http://localhost:$HTTP_PORT (USB: adb forward)"
+        updateHttpUrl()
+        runCatching { connManager.registerDefaultNetworkCallback(netCallback) }
+        mdns.start()
         // OpenCV（端末内キャリブ用）初期化＋永続化キャリブのロード（あれば焼き込み既定値を上書き）
         opencvReady = OpenCVLoader.initLocal()
         Log.i(TAG, "OpenCV init=$opencvReady")
@@ -203,9 +248,12 @@ class MainActivity : AppCompatActivity() {
                 val provider = future.get()
                 // 解析解像度。センサは8MP(3264×2448)だが、レンズ/センサの実効解像力が頭打ちで
                 // 8MPは「空の画素」が増えコストだけ上がる（実機検証で確認）。2048×1536 が速度と実効品質の最適点。
-                val rs = ResolutionSelector.Builder().setResolutionStrategy(
-                    ResolutionStrategy(Size(1920, 1080), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)
-                ).build()
+                // 魚眼キャリブ(Calib)は4:3で推定し解像度へ線形スケールするため、縦横比も4:3に固定する。
+                val rs = ResolutionSelector.Builder()
+                    .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                    .setResolutionStrategy(
+                        ResolutionStrategy(Size(2048, 1536), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)
+                    ).build()
                 val analysis = ImageAnalysis.Builder()
                     .setResolutionSelector(rs)
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
@@ -346,7 +394,7 @@ class MainActivity : AppCompatActivity() {
                 else drawOverlay(bmp, f.qrQuad, f.fieldQuad, labelFor(f.spec.name))
             }
         }
-        drawHud(bmp, fields.size)
+        qrCount = fields.size
         if (fields.isEmpty()) drawHint(bmp, "QR付きフォームをかざしてください")
         drawExpHud(bmp)
         if (now - lastShowMs > SHOW_MS) { lastShowMs = now; showPreview(bmp) }
@@ -387,8 +435,10 @@ class MainActivity : AppCompatActivity() {
             val text = res.text.trim().replace("\n", " ")
             if (text.isNotEmpty()) {
                 val changed = fieldValues.put(name, text) != text
+                fieldIds[name] = f.spec.id
                 cropView.setImageBitmap(crop)
-                bottomText()?.text = fieldValues.entries.joinToString("\n") { "${it.key}: ${it.value}" }
+                cropLabel.text = "切り出し：$name"
+                bottomText()?.text = resultsText(name)
                 httpServer.publish(name, text, lang, jpegBytes(crop), System.currentTimeMillis(), f.spec.id)
                 if (changed) speak(name, text, lang)
             }
@@ -398,6 +448,19 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** オーバーレイのラベル。OCR済みなら "name: 値"、未OCRなら name。 */
+    /** 認識結果一覧（QRのid順に1行1フィールド）。項目名=灰, 値=白, 直近に読めたフィールドの値=シアン。 */
+    private fun resultsText(latest: String): CharSequence {
+        val sb = SpannableStringBuilder()
+        val names = fieldValues.keys.sortedWith(compareBy({ fieldIds[it] ?: 0 }, { it }))
+        for (n in names) {
+            if (sb.isNotEmpty()) sb.appendLine()
+            sb.append("$n  ", ForegroundColorSpan(Color.GRAY), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            sb.append(fieldValues[n] ?: "", ForegroundColorSpan(if (n == latest) Color.CYAN else Color.WHITE),
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+        return sb
+    }
+
     private fun labelFor(name: String): String = fieldValues[name]?.let { "$name: $it" } ?: name
 
     private data class Spec(val name: String, val language: String, val x: Float, val y: Float, val w: Float, val h: Float, val id: Int = 0)
@@ -638,27 +701,35 @@ class MainActivity : AppCompatActivity() {
     private fun saveCalib() { runCatching { calibFile().writeText(Calib.toJson()) } }
     private fun loadCalib() { runCatching { if (calibFile().exists()) { Calib.fromJson(calibFile().readText()); Log.i(TAG, "loaded calib.json") } } }
 
-    /** 上部の状態バー：QR検出数・保存件数・TTS可否・閲覧URL。デモで「どこを見るか」を明示。 */
-    private fun drawHud(bmp: Bitmap, qrCount: Int) {
-        val c = Canvas(bmp)
-        val w = bmp.width.toFloat()
-        c.drawRect(0f, 0f, w, 92f, Paint().apply { color = Color.argb(150, 0, 0, 0) })
+    /**
+     * 状態バーの閲覧URL（mDNS名／LANのIP の2行）。mDNS登録時・ネットワーク変化時に呼ぶ（任意スレッド可）。
+     * どちらも無ければ USB(adb forward) を案内。
+     */
+    private fun updateHttpUrl() {
+        val mdnsUrl = mdns.committedName.takeIf { it.isNotBlank() }?.let { "http://$it:$HTTP_PORT" }
+        val lan = httpServer.urls().filterNot { it.startsWith("http://localhost") }
+        httpUrl = (listOfNotNull(mdnsUrl) + lan).joinToString("\n")
+            .ifEmpty { "http://localhost:$HTTP_PORT (USB: adb forward)" }
+    }
+
+    /** 上部の状態バー（ネイティブTextView）：QR検出数・保存件数・TTS可否・閲覧URL。デモで「どこを見るか」を明示。 */
+    private fun updateStatus() {
         val (fld, rec) = httpServer.counts()
-        c.drawText("Qrop QR    QR:$qrCount    保存 ${fld}項目/${rec}件    ${if (ttsReady) "TTS:on" else "TTS:off"}",
-            16f, 40f, Paint().apply { color = Color.WHITE; textSize = 34f; isAntiAlias = true; setShadowLayer(4f, 0f, 0f, Color.BLACK) })
-        c.drawText(httpUrl, 16f, 80f,
-            Paint().apply { color = Color.CYAN; textSize = 30f; isAntiAlias = true; setShadowLayer(4f, 0f, 0f, Color.BLACK) })
+        val st = if (calibMode) "CALIB 視点 ${min(calViews, CAL_VIEWS)}/$CAL_VIEWS"
+                 else "QR $qrCount    保存 ${fld}項目 / ${rec}件    TTS ${if (ttsReady) "on" else "off"}"
+        if (statusView.text.toString() != st) statusView.text = st
+        if (urlView.text.toString() != httpUrl) urlView.text = httpUrl
     }
 
     /** 画面中央のガイダンス（QR未検出時）。 */
     private fun drawHint(bmp: Bitmap, text: String) {
-        val p = Paint().apply { color = Color.WHITE; textSize = 50f; isAntiAlias = true; setShadowLayer(6f, 0f, 0f, Color.BLACK) }
+        val p = Paint().apply { color = Color.WHITE; textSize = 80f; isAntiAlias = true; setShadowLayer(8f, 0f, 0f, Color.BLACK) }
         Canvas(bmp).drawText(text, (bmp.width - p.measureText(text)) / 2f, bmp.height * 0.55f, p)
     }
 
     private fun showPreview(bmp: Bitmap) {
         val shown = if (bmp.width > 1080) Bitmap.createScaledBitmap(bmp, 1080, bmp.height * 1080 / bmp.width, true) else bmp
-        runOnUiThread { previewView.setImageBitmap(shown) }
+        runOnUiThread { previewView.setImageBitmap(shown); updateStatus() }
     }
 
     private fun proxyToBitmap(proxy: ImageProxy): Bitmap {
@@ -696,7 +767,10 @@ class MainActivity : AppCompatActivity() {
         t.speak(text, TextToSpeech.QUEUE_FLUSH, null, "qr")
     }
 
-    override fun onDestroy() { httpServer.stop(); tts?.stop(); tts?.shutdown(); camExec.shutdown(); super.onDestroy() }
+    override fun onDestroy() {
+        runCatching { connManager.unregisterNetworkCallback(netCallback) }
+        runCatching { mdns.stop() }
+        httpServer.stop(); tts?.stop(); tts?.shutdown(); camExec.shutdown(); super.onDestroy() }
 
     companion object {
         private const val TAG = "QropQR"

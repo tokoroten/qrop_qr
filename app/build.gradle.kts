@@ -45,4 +45,7 @@ dependencies {
 
     // OpenCV（端末内 魚眼キャリブ：findChessboardCornersSB + fisheye.calibrate）。GMS非依存のネイティブCV。
     implementation("org.opencv:opencv:4.11.0")
+
+    // mDNS（純Java・GMS非依存）。<name>.local でブラウザから名前アクセス（thinklet-gesture-cam と同じ）
+    implementation("org.jmdns:jmdns:3.5.8")
 }
