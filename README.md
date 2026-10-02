@@ -56,10 +56,11 @@ THINKLETは **Google Play Services を持たない** AOSP/Fairy OS 端末のた�
 - **オフライン QR検出**：ML Kit（バンドル版）Barcode Scanning
 - **読み上げ (TTS)**：Fairy Josee（`ai.fd.josee.app.tts`、日英オフライン）で**認識値を読み上げ**（カラム名は読まない＝日本語TTSが英字を1字ずつ読むのを回避。同じ値の連呼も抑制）。未導入時はTTS無効で動作継続
 - **端末内HTTPビューア**：OCR結果をブラウザでライブ確認＋蓄積閲覧（依存ライブラリなしの内蔵HTTPサーバ。後述）
+- **mDNS（名前アクセス）**：`http://qropqr-xxxx.local:8080` で同一LANからビューアを開ける（jmDNS, GMS非依存）。IPを調べる必要がなく、Wi-Fi接続・IP変化にも自動追従（`xxxx` は端末固有。状態バーに表示）
 - **モーションブラー対策**：Camera2 manual sensor によるアダプティブ高速シャッター
   - 露光時間の上限を **1/62s (`MAX_EXP_NS`)** に固定し、明るさを測りながらブラーを抑えつつ露出を自動調整（QRはブラーに弱いため）
 - **3分割UI**：上＝カメラLive＋認識枠（QR=緑 / フィールド=シアン）、中＝切り出した透視変換画像、下＝OCR結果文字列
-  - 上部に状態バー（**QR検出数・保存件数・TTS可否・閲覧URL**）を表示し、デモで「どこを見るか」が一目で分かる
+  - 上部に状態バー（**QR検出数・保存件数・TTS可否・閲覧URL（mDNS名／IP）**）を表示し、デモで「どこを見るか」が一目で分かる
 - **端末内 魚眼キャリブ**：タッチの無いTHINKLET向けに、**音量↑＋音量↓の同時押し**でキャリブモードへ（再ビルド不要）。チェスボードを複数視点で見せると、**端末内で OpenCV `fisheye.calibrate` を実行**して K,D を推定し `filesDir/calib.json` に永続化（再起動後も自動ロード）。PC不要。詳細は [tools/calib/](tools/calib/)
 
 ### 動作画面
@@ -86,7 +87,7 @@ adb install -r -g app/build/outputs/apk/debug/app-debug.apk
 
 1. `testdata/form_multi.png` を画面表示（または印刷）。`make_multiform.py` で再生成可。
 2. アプリを起動し、THINKLET を書類に向ける。上部の状態バーに `QR:N` と**閲覧URL**が表示される。
-3. PC/タブレットのブラウザで、状態バーのURL（同一WiFi）か、`adb forward tcp:8080 tcp:8080` 経由の `http://localhost:8080` を開く。
+3. PC/タブレットのブラウザで、状態バーのURL（同一WiFiなら mDNS名 `http://qropqr-xxxx.local:8080` か IP）か、`adb forward tcp:8080 tcp:8080` 経由の `http://localhost:8080` を開く。
 4. 各フィールドが切り出し→OCRされ、「**現在値**」に1行ずつ並び、変化が「**履歴**」に蓄積される（**CSV**で取り出し可）。
 5. 日本語フィールドは Josee 導入時に読み上げ（任意）。
 
